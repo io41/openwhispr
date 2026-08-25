@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { ProviderTabs } from "./ui/ProviderTabs";
 import { DownloadProgressBar } from "./ui/DownloadProgressBar";
@@ -15,6 +15,8 @@ export interface LocalModel {
   size: string;
   sizeBytes?: number;
   description: string;
+  descriptionKey?: string;
+  specUrl?: string;
   isDownloaded?: boolean;
   downloaded?: boolean;
   recommended?: boolean;
@@ -51,11 +53,19 @@ export default function LocalModelPicker({
 }: LocalModelPickerProps) {
   const { t } = useTranslation();
   const [downloadedModels, setDownloadedModels] = useState<Set<string>>(new Set());
+  const loadDownloadedModelsRequestRef = useRef(0);
+
+  const knownModelIds = useMemo(
+    () => new Set(providers.flatMap((provider) => provider.models.map((model) => model.id))),
+    [providers]
+  );
 
   const { confirmDialog, showConfirmDialog, hideConfirmDialog } = useDialogs();
   const styles = useMemo(() => MODEL_PICKER_COLORS[colorScheme], [colorScheme]);
 
   const loadDownloadedModels = useCallback(async () => {
+    const requestId = ++loadDownloadedModelsRequestRef.current;
+
     try {
       let downloaded = new Set<string>();
       if (modelType === "whisper") {
@@ -86,27 +96,37 @@ export default function LocalModelPicker({
           );
         }
       }
-      setDownloadedModels(downloaded);
-      return downloaded;
+      if (requestId === loadDownloadedModelsRequestRef.current) {
+        setDownloadedModels(downloaded);
+        return downloaded;
+      }
+      return null;
     } catch (error) {
       console.error("Failed to load downloaded models:", error);
-      return new Set<string>();
+      return null;
     }
   }, [modelType]);
 
   useEffect(() => {
     const initAndValidate = async () => {
       const downloaded = await loadDownloadedModels();
-      if (selectedModel && !downloaded.has(selectedModel)) {
+      // Only clear ids this picker owns — a foreign id (e.g. a cloud model)
+      // must survive untouched.
+      if (
+        downloaded &&
+        selectedModel &&
+        knownModelIds.has(selectedModel) &&
+        !downloaded.has(selectedModel)
+      ) {
         onModelSelect("");
       }
     };
     initAndValidate();
-  }, [loadDownloadedModels, selectedModel, onModelSelect]);
+  }, [loadDownloadedModels, selectedModel, onModelSelect, knownModelIds]);
 
-  const handleDownloadComplete = useCallback(() => {
-    loadDownloadedModels();
-    onDownloadComplete?.();
+  const handleDownloadComplete = useCallback(async () => {
+    await loadDownloadedModels();
+    await onDownloadComplete?.();
   }, [loadDownloadedModels, onDownloadComplete]);
 
   const {
@@ -117,15 +137,33 @@ export default function LocalModelPicker({
     isDownloadingModel,
     cancelDownload,
     isCancelling,
+    isInstalling,
   } = useModelDownload({
     modelType,
     onDownloadComplete: handleDownloadComplete,
     onModelsCleared: loadDownloadedModels,
   });
 
+  const selectionStateRef = useRef({ selectedModel, downloadedModels, knownModelIds });
+  useEffect(() => {
+    selectionStateRef.current = { selectedModel, downloadedModels, knownModelIds };
+  }, [selectedModel, downloadedModels, knownModelIds]);
+
   const handleDownload = useCallback(
     (modelId: string) => {
-      downloadModel(modelId, onModelSelect);
+      // Bootstrap auto-select, decided against current state when the download
+      // finishes so a model picked while it ran is never stolen.
+      downloadModel(modelId, (downloadedId) => {
+        const {
+          selectedModel: current,
+          downloadedModels: downloaded,
+          knownModelIds: known,
+        } = selectionStateRef.current;
+        const selectionGone = known.has(current) && !downloaded.has(current);
+        if (!current || selectionGone) {
+          onModelSelect(downloadedId);
+        }
+      });
     },
     [downloadModel, onModelSelect]
   );
@@ -150,44 +188,49 @@ export default function LocalModelPicker({
 
     const modelName = models.find((m) => m.id === downloadingModel)?.name || downloadingModel;
 
-    return <DownloadProgressBar modelName={modelName} progress={downloadProgress} />;
-  }, [downloadingModel, downloadProgress, models]);
+    return (
+      <DownloadProgressBar
+        modelName={modelName}
+        progress={downloadProgress}
+        isInstalling={isInstalling}
+      />
+    );
+  }, [downloadingModel, downloadProgress, isInstalling, models]);
 
   return (
-    <div className={`${styles.container} ${className}`}>
+    <div className={className}>
       <ProviderTabs
         providers={providers}
         selectedId={selectedProvider}
         onSelect={onProviderSelect}
         colorScheme={colorScheme}
-        scrollable
+        wrap
       />
 
       {progressDisplay}
 
-      <div className="p-3">
+      <div className="mt-2">
         <h5 className={`${styles.header} mb-2`}>{t("common.availableModels")}</h5>
 
         <ModelCardList
-          models={models.map(
-            (model): ModelCardOption => ({
-              value: model.id,
-              label: model.name,
-              description: model.size,
-              icon: getProviderIcon(selectedProvider),
-              invertInDark: isMonochromeProvider(selectedProvider),
-              recommended: model.recommended,
-              isDownloaded:
-                downloadedModels.has(model.id) || model.isDownloaded || model.downloaded,
-              isDownloading: isDownloadingModel(model.id),
-            })
-          )}
+          models={models.map((model): ModelCardOption => ({
+            value: model.id,
+            label: model.name,
+            description: model.size,
+            specUrl: model.specUrl,
+            icon: getProviderIcon(selectedProvider),
+            invertInDark: isMonochromeProvider(selectedProvider),
+            recommended: model.recommended,
+            isDownloaded: downloadedModels.has(model.id) || model.isDownloaded || model.downloaded,
+            isDownloading: isDownloadingModel(model.id),
+          }))}
           selectedModel={selectedModel}
           onModelSelect={onModelSelect}
           onDownload={handleDownload}
           onDelete={handleDelete}
           onCancelDownload={cancelDownload}
           isCancelling={isCancelling}
+          isInstalling={isInstalling}
           colorScheme={colorScheme}
         />
       </div>

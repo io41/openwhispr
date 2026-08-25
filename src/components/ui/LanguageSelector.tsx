@@ -1,8 +1,9 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { createPortal } from "react-dom";
 import { ChevronDown, Search, X, Check } from "lucide-react";
 import registry from "../../config/languageRegistry.json";
+import { LIST_SEARCH_THRESHOLD } from "../../config/constants";
 
 export interface LanguageOption {
   value: string;
@@ -21,24 +22,27 @@ interface LanguageSelectorProps {
   onChange: (value: string) => void;
   options?: LanguageOption[];
   className?: string;
+  placeholder?: string;
 }
-
-const SEARCH_THRESHOLD = 12;
 
 export default function LanguageSelector({
   value,
   onChange,
   options,
   className = "",
+  placeholder,
 }: LanguageSelectorProps) {
   const { t } = useTranslation();
   const items = options ?? REGISTRY_OPTIONS;
-  const showSearch = items.length > SEARCH_THRESHOLD;
+  const showSearch = items.length > LIST_SEARCH_THRESHOLD;
   const [isOpen, setIsOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const [dropdownPosition, setDropdownPosition] = useState({ top: 0, left: 0, width: 0 });
-  const containerRef = useRef<HTMLDivElement>(null);
+  const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(
+    typeof document === "undefined" ? null : document.body
+  );
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -51,39 +55,46 @@ export default function LanguageSelector({
       )
     : items;
 
-  useEffect(() => {
+  const handleSearchQueryChange = useCallback((value: string) => {
+    setSearchQuery(value);
     setHighlightedIndex(0);
-  }, [searchQuery]);
+  }, []);
 
   // Determine the portal container: use the closest dialog if inside one (to stay
   // within Radix's focus trap), otherwise fall back to document.body.
-  const portalTarget = useRef<HTMLElement>(document.body);
-
-  useEffect(() => {
-    if (containerRef.current) {
-      const dialog = containerRef.current.closest('[role="dialog"]');
-      portalTarget.current = (dialog as HTMLElement) ?? document.body;
-    }
+  const setContainerNode = useCallback((node: HTMLDivElement | null) => {
+    containerRef.current = node;
+    if (!node) return;
+    const dialog = node.closest('[role="dialog"]');
+    setPortalTarget((dialog as HTMLElement) ?? document.body);
   }, []);
 
   useEffect(() => {
-    if (isOpen && triggerRef.current) {
+    if (isOpen && triggerRef.current && portalTarget) {
       const triggerRect = triggerRef.current.getBoundingClientRect();
-      const target = portalTarget.current;
+      const target = portalTarget;
       // When portaled into a transformed ancestor (e.g. Radix Dialog),
       // fixed positioning is relative to that ancestor, not the viewport.
       const offsetX = target === document.body ? 0 : target.getBoundingClientRect().left;
       const offsetY = target === document.body ? 0 : target.getBoundingClientRect().top;
+      const menuWidth = Math.max(triggerRect.width, 240);
+      const containerRight =
+        (target === document.body ? window.innerWidth : target.getBoundingClientRect().right) -
+        offsetX;
+      let left = triggerRect.left - offsetX;
+      if (left + menuWidth > containerRight - 8) {
+        left = Math.max(8, triggerRect.right - offsetX - menuWidth);
+      }
       setDropdownPosition({
         top: triggerRect.bottom + 4 - offsetY,
-        left: triggerRect.left - offsetX,
-        width: triggerRect.width,
+        left,
+        width: menuWidth,
       });
       requestAnimationFrame(() => {
         searchInputRef.current?.focus();
       });
     }
-  }, [isOpen]);
+  }, [isOpen, portalTarget]);
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       const target = event.target as Node;
@@ -127,7 +138,7 @@ export default function LanguageSelector({
       case "Escape":
         e.preventDefault();
         setIsOpen(false);
-        setSearchQuery("");
+        handleSearchQueryChange("");
         break;
     }
   };
@@ -135,18 +146,20 @@ export default function LanguageSelector({
   const handleSelect = (languageValue: string) => {
     onChange(languageValue);
     setIsOpen(false);
-    setSearchQuery("");
+    handleSearchQueryChange("");
   };
 
   const clearSearch = () => {
-    setSearchQuery("");
+    handleSearchQueryChange("");
     if (searchInputRef.current) {
       searchInputRef.current.focus();
     }
   };
 
+  const selected = items.find((l) => l.value === value);
+
   return (
-    <div className={`relative ${className}`} ref={containerRef}>
+    <div className={`relative ${className}`} ref={setContainerNode}>
       {/* Trigger button - premium, tight, tactile macOS-style */}
       <button
         ref={triggerRef}
@@ -169,11 +182,9 @@ export default function LanguageSelector({
         aria-haspopup="listbox"
         aria-expanded={isOpen}
       >
-        <span className="truncate text-foreground">
-          <span className="mr-1.5">
-            {items.find((l) => l.value === value)?.flag ?? "\uD83C\uDF10"}
-          </span>
-          {items.find((l) => l.value === value)?.label ?? value}
+        <span className={`truncate ${selected ? "text-foreground" : "text-muted-foreground"}`}>
+          <span className="mr-1.5">{selected?.flag ?? "\uD83C\uDF10"}</span>
+          {selected?.label ?? (value || placeholder || "")}
         </span>
         <ChevronDown
           className={`w-3.5 h-3.5 shrink-0 text-muted-foreground transition-[color,transform] duration-200 ${
@@ -184,6 +195,7 @@ export default function LanguageSelector({
 
       {/* Dropdown - ultra-premium glassmorphic panel (rendered via portal) */}
       {isOpen &&
+        portalTarget &&
         createPortal(
           <div
             ref={dropdownRef}
@@ -203,7 +215,7 @@ export default function LanguageSelector({
                     ref={searchInputRef}
                     type="text"
                     value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onChange={(e) => handleSearchQueryChange(e.target.value)}
                     onKeyDown={handleKeyDown}
                     placeholder={t("languageSelector.searchPlaceholder")}
                     className="w-full h-7 pl-7 pr-6 text-xs bg-transparent text-foreground border-0 focus:outline-none placeholder:text-muted-foreground/50"
@@ -265,7 +277,7 @@ export default function LanguageSelector({
               )}
             </div>
           </div>,
-          portalTarget.current
+          portalTarget
         )}
     </div>
   );

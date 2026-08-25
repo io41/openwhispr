@@ -1,20 +1,78 @@
-import { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback, type ComponentProps } from "react";
 import { useTranslation } from "react-i18next";
-import { Download, Loader2, FileText, Sparkles, AlignLeft, Radio } from "lucide-react";
-import { MarkdownTextarea } from "../ui/MarkdownTextarea";
+import {
+  Download,
+  Loader2,
+  FileText,
+  Sparkles,
+  AlignLeft,
+  MessageSquareText,
+  Calendar,
+  LinkIcon,
+  FolderOpen,
+  Search,
+  Plus,
+  Check,
+  Share2,
+  Users,
+} from "lucide-react";
+import ShareNoteDialog from "./ShareNoteDialog";
+import {
+  canOrganizeNote,
+  noteCapabilities,
+  resolveNotePermission,
+  type NoteAclState,
+} from "../../lib/notePermissions";
+import { ownsNote } from "../../lib/spacePermissions";
+import SpaceMembersDialog from "./SpaceMembersDialog";
+import {
+  useShareCacheEntry,
+  useNoteConflict,
+  useSpaces,
+  clearNoteConflict,
+  navigateToContainer,
+  persistNoteShareState,
+  updateNoteInStore,
+  updateShareCache,
+} from "../../stores/noteStore";
+import { NoteSharingService } from "../../services/NoteSharingService";
+import { fetchSpaceRoster } from "../../hooks/useSpaceRoster";
+import { useAuth } from "../../hooks/useAuth";
+import { RichTextEditor } from "../ui/RichTextEditor";
+import type { Editor } from "@tiptap/react";
+import { MeetingTranscriptChat, SelectionBar } from "./MeetingTranscriptChat";
+import {
+  useMeetingRecordingStore,
+  type TranscriptSegment,
+} from "../../stores/meetingRecordingStore";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from "../ui/dropdown-menu";
 import { cn } from "../lib/utils";
-import type { NoteItem } from "../../types/electron";
+import type { NoteItem, FolderItem } from "../../types/electron";
 import type { ActionProcessingState } from "../../hooks/useActionProcessing";
 import ActionProcessingOverlay from "./ActionProcessingOverlay";
-import DictationWidget from "./DictationWidget";
-import { normalizeDbDate } from "../../utils/dateFormatting";
-import { useSettingsStore } from "../../stores/settingsStore";
+import NoteBottomBar from "./NoteBottomBar";
+import EmbeddedChat, { type EmbeddedChatMode } from "./EmbeddedChat";
+import { useEmbeddedChat } from "../../hooks/useEmbeddedChat";
+import { normalizeDbDate, formatRelativeTime, formatShortDate } from "../../utils/dateFormatting";
+import { collectKnownPeople } from "../../utils/llmTranscript";
+import { parseTranscriptSegments } from "../../utils/parseTranscriptSegments";
+import {
+  applyTranscriptSpeakerPatch,
+  lockTranscriptSpeaker,
+  serializeTranscriptSegments,
+} from "../../utils/transcriptSpeakerState";
+import NoteParticipants from "./NoteParticipants";
+import type { CalendarAttendee } from "../../types/calendar";
+import { observeFloatingChatLayout } from "./floatingChatLayout";
+
+const CHIP_BUTTON_CLASS =
+  "inline-flex items-center gap-1.5 text-[11px] px-1.5 py-0.5 rounded-md border border-border/70 dark:border-white/25 text-foreground/50 dark:text-foreground/35 hover:text-foreground/60 hover:border-border/60 hover:bg-foreground/3 dark:hover:text-foreground/40 dark:hover:border-white/10 dark:hover:bg-white/3 transition-all duration-150 cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-ring/30";
 
 function formatNoteDate(dateStr: string): string {
   const date = normalizeDbDate(dateStr);
@@ -31,99 +89,111 @@ function formatNoteDate(dateStr: string): string {
 export interface Enhancement {
   content: string;
   isStale: boolean;
-  onChange: (content: string) => void;
+  onChange: (sourceNoteId: number, content: string) => void;
+}
+
+type MeetingViewMode = "raw" | "transcript" | "enhanced";
+
+type SpeakerProfileOption = { id?: number; display_name: string; email: string | null };
+
+function buildKnownSpeakers(
+  profiles: SpeakerProfileOption[],
+  segments: TranscriptSegment[],
+  mappings: Record<string, string>
+): SpeakerProfileOption[] {
+  const seen = new Set<string>();
+  const list: SpeakerProfileOption[] = [];
+  for (const p of profiles) {
+    const key = p.display_name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    list.push(p);
+  }
+  for (const segment of segments) {
+    if (!segment.speaker) continue;
+    const name = mappings[segment.speaker] || segment.speakerName;
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    list.push({ display_name: name, email: null });
+  }
+  return list;
+}
+
+type LiveMeetingTranscriptChatProps = Omit<
+  ComponentProps<typeof MeetingTranscriptChat>,
+  | "segments"
+  | "micPartial"
+  | "systemPartial"
+  | "systemPartialSpeakerId"
+  | "systemPartialSpeakerName"
+  | "isRecording"
+>;
+
+// Subscribes to live transcript state at this leaf so per-update re-renders
+// don't reach the editor/chat (which would drop text selection).
+function LiveMeetingTranscriptChat({
+  speakerProfiles,
+  speakerMappings,
+  ...props
+}: LiveMeetingTranscriptChatProps) {
+  const segments = useMeetingRecordingStore((s) => s.segments);
+  const micPartial = useMeetingRecordingStore((s) => s.micPartial);
+  const systemPartial = useMeetingRecordingStore((s) => s.systemPartial);
+  const systemPartialSpeakerId = useMeetingRecordingStore((s) => s.systemPartialSpeakerId);
+  const systemPartialSpeakerName = useMeetingRecordingStore((s) => s.systemPartialSpeakerName);
+
+  const knownSpeakers = useMemo(
+    () => buildKnownSpeakers(speakerProfiles ?? [], segments, speakerMappings ?? {}),
+    [segments, speakerMappings, speakerProfiles]
+  );
+
+  return (
+    <MeetingTranscriptChat
+      {...props}
+      isRecording
+      segments={segments}
+      micPartial={micPartial}
+      systemPartial={systemPartial}
+      systemPartialSpeakerId={systemPartialSpeakerId}
+      systemPartialSpeakerName={systemPartialSpeakerName}
+      speakerMappings={speakerMappings}
+      speakerProfiles={knownSpeakers}
+    />
+  );
 }
 
 interface NoteEditorProps {
   note: NoteItem;
-  onTitleChange: (title: string) => void;
-  onContentChange: (content: string) => void;
+  onTitleChange: (sourceNoteId: number, title: string) => void;
+  onContentChange: (sourceNoteId: number, content: string) => void;
   isSaving: boolean;
   isRecording: boolean;
-  partialTranscript: string;
-  finalTranscript: string | null;
-  onFinalTranscriptConsumed: () => void;
-  streamingCommit: string | null;
-  onStreamingCommitConsumed: () => void;
   isProcessing: boolean;
+  recordingAllowed?: boolean;
   onStartRecording: () => void;
   onStopRecording: () => void;
   onExportNote?: (format: "md" | "txt") => void;
+  onExportTranscript?: (format: "txt" | "srt" | "json" | "md") => void;
   enhancement?: Enhancement;
   actionPicker?: React.ReactNode;
   actionProcessingState?: ActionProcessingState;
   actionName?: string | null;
-}
-
-interface DictationRange {
-  start: number;
-  partialStart: number;
-  end: number;
-  committedChars: number;
-}
-
-interface TextSelectionRange {
-  start: number;
-  end: number;
-}
-
-interface PendingSelectionRestore extends TextSelectionRange {
-  version: number;
-}
-
-function transformSelectionForReplacement(
-  selection: TextSelectionRange,
-  replaceStart: number,
-  replaceEnd: number,
-  insertLength: number
-): TextSelectionRange {
-  const replacementEnd = replaceStart + insertLength;
-
-  const overlapsReplacement =
-    selection.start === selection.end
-      ? selection.start >= replaceStart && selection.start <= replaceEnd
-      : selection.start < replaceEnd && selection.end > replaceStart;
-
-  if (overlapsReplacement) {
-    return { start: replacementEnd, end: replacementEnd };
-  }
-
-  const delta = insertLength - (replaceEnd - replaceStart);
-  const shift = (index: number) => {
-    if (index > replaceEnd) return index + delta;
-    if (index === replaceEnd) return replacementEnd;
-    return index;
-  };
-
-  return {
-    start: shift(selection.start),
-    end: shift(selection.end),
-  };
-}
-
-function mapIndexThroughUserEdit(
-  index: number,
-  editStart: number,
-  editEnd: number,
-  insertLength: number
-): number {
-  const delta = insertLength - (editEnd - editStart);
-
-  if (editStart === editEnd) {
-    return index < editStart ? index : index + delta;
-  }
-
-  if (index < editStart) return index;
-  if (index > editEnd) return index + delta;
-  return editStart + insertLength;
-}
-
-function mapIndexAfterRangeRemoval(index: number, removeStart: number, removeEnd: number): number {
-  const removedLength = removeEnd - removeStart;
-
-  if (index < removeStart) return index;
-  if (index > removeEnd) return index - removedLength;
-  return removeStart;
+  diarizationSessionId?: string | null;
+  onLiveSpeakerLock?: (speakerId: string, displayName: string) => void;
+  sessionDiarizationEnabled?: boolean;
+  sessionExpectedCount?: number;
+  userTouchedStepper?: boolean;
+  onSetSessionDiarizationEnabled?: (enabled: boolean) => void;
+  onSetSessionExpectedCount?: (count: number) => void;
+  folderName?: string | null;
+  calendarEventName?: string | null;
+  folders?: FolderItem[];
+  onMoveToFolder?: (noteId: number, folderId: number) => void;
+  onCreateFolderAndMove?: (noteId: number, folderName: string) => void;
+  /** Cancels the owner's debounced autosaves before an external copy is applied. */
+  onCancelPendingSaves?: (noteId: number) => void;
 }
 
 export default function NoteEditor({
@@ -133,232 +203,243 @@ export default function NoteEditor({
   isSaving,
   isRecording,
   isProcessing,
-  partialTranscript,
-  finalTranscript,
-  onFinalTranscriptConsumed,
-  streamingCommit,
-  onStreamingCommitConsumed,
+  recordingAllowed = true,
   onStartRecording,
   onStopRecording,
   onExportNote,
+  onExportTranscript,
   enhancement,
   actionPicker,
   actionProcessingState,
   actionName,
+  diarizationSessionId,
+  onLiveSpeakerLock,
+  sessionDiarizationEnabled,
+  sessionExpectedCount,
+  userTouchedStepper,
+  onSetSessionDiarizationEnabled,
+  onSetSessionExpectedCount,
+  folderName,
+  calendarEventName,
+  folders,
+  onMoveToFolder,
+  onCreateFolderAndMove,
+  onCancelPendingSaves,
 }: NoteEditorProps) {
   const { t } = useTranslation();
-  const [viewMode, setViewMode] = useState<"raw" | "enhanced">("raw");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [viewMode, setViewMode] = useState<MeetingViewMode>("raw");
+  const [chatMode, setChatMode] = useState<EmbeddedChatMode>("hidden");
+  const [folderSearch, setFolderSearch] = useState("");
+  const [isCreatingFolder, setIsCreatingFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [isDiarizing, setIsDiarizing] = useState(false);
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [membersDialogOpen, setMembersDialogOpen] = useState(false);
+  const [aclRetryVersion, setAclRetryVersion] = useState(0);
+  const [aclRequest, setAclRequest] = useState<{
+    cloudId: string;
+    state: Extract<NoteAclState, "loading" | "unavailable">;
+  } | null>(null);
+  const { isSignedIn, user } = useAuth();
+  const shareCache = useShareCacheEntry(note.cloud_id);
+  const spaces = useSpaces();
+  const space = useMemo(
+    () => spaces.find((s) => s.id === note.space_id) ?? null,
+    [spaces, note.space_id]
+  );
+  const isTeamNote = space?.kind === "team";
+  // Persisted flag is the restart-safe truth; the live cache overlays it for
+  // the current session (it reflects server state before the flag persists).
+  const isShared = shareCache ? shareCache.share.visibility !== "private" : Boolean(note.is_shared);
+  const aclState: NoteAclState = shareCache
+    ? "loaded"
+    : !note.cloud_id || !isSignedIn
+      ? "unavailable"
+      : aclRequest?.cloudId === note.cloud_id
+        ? aclRequest.state
+        : "loading";
+  const notePermission = resolveNotePermission({
+    cachedPermission: shareCache?.access?.my_permission,
+    aclState,
+    isTeamNote,
+    locallyOwned: ownsNote(note, user?.id),
+  });
+  const shareCapabilities = noteCapabilities(notePermission);
+  const canShare =
+    isSignedIn &&
+    (!note.cloud_id || isTeamNote || aclState === "loaded") &&
+    shareCapabilities.canShare;
+  const canEditNote = shareCapabilities.canEdit;
+  // Re-filing is owner-only on shared personal notes (a denied folder_id
+  // PATCH would fork an unexpected Personal copy); team members keep
+  // same-space folder moves.
+  const canMoveToFolders = canOrganizeNote(notePermission, {
+    isTeamNote,
+    hasCloudCopy: Boolean(note.cloud_id),
+  });
+  useEffect(() => {
+    if (!isSignedIn || !note.cloud_id || shareCache) return;
+    const cloudId = note.cloud_id;
+    let cancelled = false;
+    setAclRequest({ cloudId, state: "loading" });
+    NoteSharingService.getShareSettings(cloudId)
+      .then((res) => {
+        if (cancelled) return;
+        updateShareCache(cloudId, (entry) => ({
+          share: res.share,
+          invitations: res.invitations,
+          access: res.access ?? entry?.access,
+          rawToken: entry?.rawToken ?? null,
+        }));
+        const serverShared = res.share.visibility !== "private";
+        if (serverShared !== Boolean(note.is_shared)) {
+          void persistNoteShareState(
+            note.id,
+            serverShared ? { is_shared: 1 } : { is_shared: 0, share_token: null }
+          ).catch((err) => console.error("Share flag persist failed:", err));
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setAclRequest({ cloudId, state: "unavailable" });
+        console.error("Failed to load note permissions:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [aclRetryVersion, isSignedIn, note.cloud_id, note.id, note.is_shared, shareCache]);
+  useEffect(() => {
+    if (
+      !isSignedIn ||
+      !note.cloud_id ||
+      shareCache ||
+      aclRequest?.cloudId !== note.cloud_id ||
+      aclRequest.state !== "unavailable"
+    ) {
+      return;
+    }
+    const retryWhenOnline = () => setAclRetryVersion((version) => version + 1);
+    window.addEventListener("online", retryWhenOnline);
+    return () => window.removeEventListener("online", retryWhenOnline);
+  }, [aclRequest, isSignedIn, note.cloud_id, shareCache]);
+  // A newer cloud copy arrived while this note had unpushed edits (plan §7.3).
+  const conflict = useNoteConflict(note.client_note_id);
+  const [conflictEditorName, setConflictEditorName] = useState<string | null>(null);
+  const conflictEditorId =
+    conflict?.updated_by_user_id && user?.id && conflict.updated_by_user_id !== user.id
+      ? conflict.updated_by_user_id
+      : null;
+  const conflictSpaceId = space?.cloud_space_id ?? null;
+  useEffect(() => {
+    if (!conflictEditorId || !conflictSpaceId) {
+      setConflictEditorName(null);
+      return;
+    }
+    let cancelled = false;
+    fetchSpaceRoster(conflictSpaceId)
+      .then((roster) => {
+        if (cancelled) return;
+        const member = roster.find((m) => m.user_id === conflictEditorId);
+        setConflictEditorName(member ? (member.name ?? member.email) : null);
+      })
+      .catch(() => {
+        if (!cancelled) setConflictEditorName(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conflictEditorId, conflictSpaceId]);
+  const [diarizedSegments, setDiarizedSegments] = useState<TranscriptSegment[] | null>(null);
+  const [speakerMappings, setSpeakerMappings] = useState<Record<string, string>>({});
+  const [speakerProfiles, setSpeakerProfiles] = useState<
+    Array<{ id: number; display_name: string; email: string | null }>
+  >([]);
+  const editorRef = useRef<Editor | null>(null);
+
+  const embeddedChat = useEmbeddedChat({
+    noteId: note.id,
+    folderId: note.folder_id,
+    noteTitle: note.title,
+    noteContent: note.content,
+    noteTranscript: note.transcript ?? undefined,
+  });
   const titleRef = useRef<HTMLDivElement>(null);
   const prevNoteIdRef = useRef<number>(note.id);
-
-  const isSignedIn = useSettingsStore((s) => s.isSignedIn);
-  const cloudMode = useSettingsStore((s) => s.cloudTranscriptionMode);
-  const useLocalWhisper = useSettingsStore((s) => s.useLocalWhisper);
-  const canStream = isSignedIn && cloudMode === "openwhispr" && !useLocalWhisper;
-
-  const [liveMode, setLiveMode] = useState(() => {
-    const pref = localStorage.getItem("notesStreamingPreference");
-    return pref === "streaming" || (pref !== "batch" && canStream);
-  });
-
-  const handleLiveToggle = useCallback(() => {
-    setLiveMode((prev) => {
-      const next = !prev;
-      localStorage.setItem("notesStreamingPreference", next ? "streaming" : "batch");
-      return next;
-    });
-  }, []);
-
-  const cursorPosRef = useRef(0);
-  const selectionEndRef = useRef(0);
-  const dictationRef = useRef<DictationRange | null>(null);
-  const prevRecordingRef = useRef(false);
-  const expectedSelectionRef = useRef<TextSelectionRange>({ start: 0, end: 0 });
-  const selectionVersionRef = useRef(0);
-  const pendingSelectionRestoreRef = useRef<PendingSelectionRestore | null>(null);
-  const suppressSelectionCaptureRef = useRef(false);
-  const beforeInputSelectionRef = useRef<TextSelectionRange | null>(null);
-  const contentRef = useRef(note.content);
-  contentRef.current = note.content;
-
-  const syncSelectionRefs = useCallback((start: number, end: number) => {
-    cursorPosRef.current = start;
-    selectionEndRef.current = end;
-    expectedSelectionRef.current = { start, end };
-  }, []);
-
-  const queueSelectionRestore = useCallback(
-    (start: number, end: number, version = selectionVersionRef.current) => {
-      syncSelectionRefs(start, end);
-      pendingSelectionRestoreRef.current = { start, end, version };
-    },
-    [syncSelectionRefs]
-  );
-
-  const applyProgrammaticSelection = useCallback(
-    (start: number, end: number) => {
-      const ta = textareaRef.current;
-      if (!ta) return;
-      suppressSelectionCaptureRef.current = true;
-      ta.setSelectionRange(start, end);
-      queueMicrotask(() => {
-        suppressSelectionCaptureRef.current = false;
-      });
-      syncSelectionRefs(start, end);
-    },
-    [syncSelectionRefs]
-  );
-
-  const commitContentChange = useCallback(
-    (newContent: string, nextSelection?: TextSelectionRange, selectionVersion?: number) => {
-      if (nextSelection) {
-        queueSelectionRestore(nextSelection.start, nextSelection.end, selectionVersion);
-      }
-      contentRef.current = newContent;
-      onContentChange(newContent);
-    },
-    [onContentChange, queueSelectionRestore]
-  );
-
-  const replaceContentRange = useCallback(
-    (replaceStart: number, replaceEnd: number, insertText: string) => {
-      const currentContent = contentRef.current;
-      const before = currentContent.slice(0, replaceStart);
-      const after = currentContent.slice(replaceEnd);
-      const newContent = before + insertText + after;
-      const selectionBefore = expectedSelectionRef.current;
-      const selectionVersion = selectionVersionRef.current;
-      const nextSelection = transformSelectionForReplacement(
-        selectionBefore,
-        replaceStart,
-        replaceEnd,
-        insertText.length
-      );
-
-      commitContentChange(newContent, nextSelection, selectionVersion);
-      return newContent;
-    },
-    [commitContentChange]
-  );
-
-  const reanchorDictationToSelection = useCallback(
-    (anchorStart: number, anchorEnd: number, selectionVersion: number) => {
-      const range = dictationRef.current;
-      if (!range) return;
-
-      if (range.partialStart === range.end) {
-        range.start = anchorStart;
-        range.partialStart = anchorStart;
-        range.end = anchorEnd;
-        return;
-      }
-
-      const currentContent = contentRef.current;
-      const partialText = currentContent.slice(range.partialStart, range.end);
-
-      if (!partialText) {
-        range.start = anchorStart;
-        range.partialStart = anchorStart;
-        range.end = anchorEnd;
-        return;
-      }
-
-      const withoutPartial =
-        currentContent.slice(0, range.partialStart) + currentContent.slice(range.end);
-      const targetStart = mapIndexAfterRangeRemoval(anchorStart, range.partialStart, range.end);
-      const targetEnd = mapIndexAfterRangeRemoval(anchorEnd, range.partialStart, range.end);
-      const newContent =
-        withoutPartial.slice(0, targetStart) + partialText + withoutPartial.slice(targetEnd);
-
-      const newPartialStart = targetStart;
-      const newEnd = newPartialStart + partialText.length;
-
-      range.start = newPartialStart;
-      range.partialStart = newPartialStart;
-      range.end = newEnd;
-
-      commitContentChange(newContent, { start: newEnd, end: newEnd }, selectionVersion);
-    },
-    [commitContentChange]
-  );
-
-  const captureUserSelection = useCallback(
-    (start: number, end: number) => {
-      const prev = expectedSelectionRef.current;
-      const changed = prev.start !== start || prev.end !== end;
-
-      syncSelectionRefs(start, end);
-
-      if (!changed) return;
-
-      selectionVersionRef.current += 1;
-
-      if (dictationRef.current) {
-        reanchorDictationToSelection(start, end, selectionVersionRef.current);
-      }
-    },
-    [reanchorDictationToSelection, syncSelectionRefs]
-  );
-
-  useLayoutEffect(() => {
-    const pending = pendingSelectionRestoreRef.current;
-    if (!pending) return;
-    pendingSelectionRestoreRef.current = null;
-    if (pending.version !== selectionVersionRef.current) return;
-    applyProgrammaticSelection(pending.start, pending.end);
-  }, [note.content, applyProgrammaticSelection]);
-
-  // Capture selection before browser applies user edits so dictation range
-  // adjustments handle replacements/paste correctly.
-  useEffect(() => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const handler = () => {
-      if (suppressSelectionCaptureRef.current) return;
-      beforeInputSelectionRef.current = {
-        start: ta.selectionStart,
-        end: ta.selectionEnd,
-      };
-    };
-    ta.addEventListener("beforeinput", handler);
-    return () => {
-      ta.removeEventListener("beforeinput", handler);
-    };
-  }, [viewMode]);
-
-  // Capture cursor on mouse interaction — click for positioning,
-  // mouseup for drag-selections (click may not fire if drag distance is large)
-  useEffect(() => {
-    const ta = textareaRef.current;
-    if (!ta) return;
-    const handler = () => {
-      if (suppressSelectionCaptureRef.current) return;
-      captureUserSelection(ta.selectionStart, ta.selectionEnd);
-    };
-    ta.addEventListener("click", handler);
-    ta.addEventListener("mouseup", handler);
-    return () => {
-      ta.removeEventListener("click", handler);
-      ta.removeEventListener("mouseup", handler);
-    };
-  }, [captureUserSelection, viewMode]);
+  const autoShowDoneRef = useRef(false);
 
   const segmentContainerRef = useRef<HTMLDivElement>(null);
   const [indicatorStyle, setIndicatorStyle] = useState<React.CSSProperties>({ opacity: 0 });
+  const scheduleUiUpdate = useCallback((callback: () => void) => {
+    const frameId = window.requestAnimationFrame(callback);
+    return () => window.cancelAnimationFrame(frameId);
+  }, []);
+
+  const hasMeetingTranscript = !!note.transcript;
+
+  const filteredFolders = useMemo(
+    () =>
+      folderSearch && folders
+        ? folders.filter((f) => f.name.toLowerCase().includes(folderSearch.toLowerCase()))
+        : (folders ?? []),
+    [folders, folderSearch]
+  );
+
+  const displaySegments = useMemo<TranscriptSegment[]>(() => {
+    if (diarizedSegments && diarizedSegments.length > 0) return diarizedSegments;
+    return parseTranscriptSegments(note.transcript || "");
+  }, [diarizedSegments, note.transcript]);
+
+  const hasChatSegments = displaySegments.length > 0;
+
+  const knownSpeakers = useMemo(
+    () => buildKnownSpeakers(speakerProfiles, displaySegments, speakerMappings),
+    [displaySegments, speakerMappings, speakerProfiles]
+  );
+
+  const parsedParticipants = useMemo<CalendarAttendee[]>(() => {
+    try {
+      return note.participants ? JSON.parse(note.participants) : [];
+    } catch {
+      return [];
+    }
+  }, [note.participants]);
+
+  const mentionPeople = useMemo(
+    () =>
+      collectKnownPeople(
+        {
+          selfName: user?.name?.trim() || null,
+          selfEmail: user?.email?.trim() || null,
+          participants: parsedParticipants,
+        },
+        speakerMappings,
+        displaySegments
+      ),
+    [user?.name, user?.email, parsedParticipants, speakerMappings, displaySegments]
+  );
+
+  const refreshSpeakerProfiles = useCallback(() => {
+    window.electronAPI?.getSpeakerProfiles?.().then((profiles) => {
+      setSpeakerProfiles(
+        (profiles || []).map((profile) => ({
+          id: profile.id,
+          display_name: profile.display_name,
+          email: profile.email,
+        }))
+      );
+    });
+  }, []);
 
   const updateSegmentIndicator = useCallback(() => {
     const container = segmentContainerRef.current;
     if (!container) return;
 
-    const idx = viewMode === "raw" ? 0 : 1;
-
     const buttons = container.querySelectorAll<HTMLButtonElement>("[data-segment-button]");
-    const btn = buttons[idx];
-    if (!btn) return;
+    const activeBtn = Array.from(buttons).find((btn) => btn.dataset.segmentValue === viewMode);
+    if (!activeBtn) return;
 
     const cr = container.getBoundingClientRect();
-    const br = btn.getBoundingClientRect();
+    const br = activeBtn.getBoundingClientRect();
     setIndicatorStyle({
       width: br.width,
       height: br.height,
@@ -379,29 +460,55 @@ export default function NoteEditor({
 
   const prevProcessingStateRef = useRef(actionProcessingState);
   useEffect(() => {
+    let cancelScheduledUpdate: (() => void) | undefined;
+
     if (prevProcessingStateRef.current === "processing" && actionProcessingState === "success") {
-      setViewMode("enhanced");
+      cancelScheduledUpdate = scheduleUiUpdate(() => setViewMode("enhanced"));
     }
     prevProcessingStateRef.current = actionProcessingState;
-  }, [actionProcessingState]);
+
+    return cancelScheduledUpdate;
+  }, [actionProcessingState, scheduleUiUpdate]);
 
   useEffect(() => {
     if (note.id !== prevNoteIdRef.current) {
       prevNoteIdRef.current = note.id;
-      setViewMode("raw");
-      if (titleRef.current && titleRef.current.textContent !== note.title) {
-        titleRef.current.textContent = note.title || "";
-      }
-      textareaRef.current?.focus();
-      if (textareaRef.current) {
-        const start = textareaRef.current.selectionStart;
-        const end = textareaRef.current.selectionEnd;
-        syncSelectionRefs(start, end);
-      }
-      pendingSelectionRestoreRef.current = null;
-      beforeInputSelectionRef.current = null;
+      autoShowDoneRef.current = false;
+      return scheduleUiUpdate(() => {
+        setChatMode("hidden");
+        setDiarizedSegments(null);
+        setIsDiarizing(false);
+        setSpeakerMappings({});
+        if (!isRecording) {
+          setViewMode("raw");
+        }
+        if (titleRef.current && titleRef.current.textContent !== note.title) {
+          titleRef.current.textContent = note.title || "";
+        }
+        editorRef.current?.commands.focus();
+      });
     }
-  }, [note.id, syncSelectionRefs]);
+  }, [isRecording, note.id, note.title, scheduleUiUpdate]);
+
+  useEffect(() => {
+    window.electronAPI?.getSpeakerMappings?.(note.id).then((mappings) => {
+      const map: Record<string, string> = {};
+      for (const m of mappings || []) map[m.speaker_id] = m.display_name;
+      setSpeakerMappings(map);
+    });
+    refreshSpeakerProfiles();
+  }, [note.id, refreshSpeakerProfiles]);
+
+  useEffect(() => {
+    if (
+      !autoShowDoneRef.current &&
+      embeddedChat.activeConversationId &&
+      embeddedChat.messages.length > 0
+    ) {
+      autoShowDoneRef.current = true;
+      return scheduleUiUpdate(() => setChatMode("floating"));
+    }
+  }, [embeddedChat.activeConversationId, embeddedChat.messages.length, scheduleUiUpdate]);
 
   useEffect(() => {
     if (titleRef.current && titleRef.current.textContent !== note.title) {
@@ -409,17 +516,190 @@ export default function NoteEditor({
     }
   }, [note.title]);
 
+  const prevRecordingForDiarizationRef = useRef(false);
+  useEffect(() => {
+    if (prevRecordingForDiarizationRef.current && !isRecording && diarizationSessionId) {
+      const cancelScheduledUpdate = scheduleUiUpdate(() => setIsDiarizing(true));
+      prevRecordingForDiarizationRef.current = isRecording;
+      return cancelScheduledUpdate;
+    }
+    prevRecordingForDiarizationRef.current = isRecording;
+  }, [diarizationSessionId, isRecording, scheduleUiUpdate]);
+
+  // Persistence happens in meetingRecordingStore's module-level listener
+  // (#1495); this only mirrors a published result into the rendered note's UI.
+  const completedDiarization = useMeetingRecordingStore((s) => s.completedDiarization);
+  useEffect(() => {
+    if (!completedDiarization || completedDiarization.noteId !== note.id) return;
+    // Consume so a remount can't repaint this overlay over newer edits; the
+    // transcript itself is already persisted.
+    useMeetingRecordingStore.setState({ completedDiarization: null });
+    setIsDiarizing(false);
+
+    const enriched = completedDiarization.segments;
+    if (enriched.length === 0) return;
+    setDiarizedSegments(enriched);
+
+    const autoMappings: Record<string, string> = {};
+    for (const s of enriched) {
+      if (s.speakerName && s.speaker) autoMappings[s.speaker] = s.speakerName;
+    }
+    if (Object.keys(autoMappings).length > 0) {
+      setSpeakerMappings((prev) => ({ ...autoMappings, ...prev }));
+    }
+  }, [completedDiarization, note.id]);
+
+  const persistDisplaySegments = useCallback(
+    async (nextSegments: TranscriptSegment[], updateOverlay = true) => {
+      if (updateOverlay) {
+        setDiarizedSegments(nextSegments);
+      }
+      await window.electronAPI?.updateNote(note.id, {
+        transcript: serializeTranscriptSegments(nextSegments),
+      });
+    },
+    [note.id]
+  );
+
+  const handleMapSpeaker = useCallback(
+    async (
+      speakerId: string,
+      displayName: string,
+      email?: string | null,
+      profileId?: number | null
+    ) => {
+      setSpeakerMappings((prev) => ({ ...prev, [speakerId]: displayName }));
+      await window.electronAPI?.setSpeakerMapping?.(
+        note.id,
+        speakerId,
+        displayName,
+        email,
+        profileId
+      );
+
+      if (isRecording) {
+        onLiveSpeakerLock?.(speakerId, displayName);
+        refreshSpeakerProfiles();
+        return;
+      }
+
+      const currentSegments = displaySegments.map((s) =>
+        s.speaker === speakerId
+          ? lockTranscriptSpeaker(s, {
+              speakerName: displayName,
+              speaker: speakerId,
+              speakerIsPlaceholder: false,
+              suggestedName: undefined,
+              suggestedProfileId: undefined,
+            })
+          : s
+      );
+      await persistDisplaySegments(currentSegments, !!diarizedSegments || !isRecording);
+
+      refreshSpeakerProfiles();
+    },
+    [
+      diarizedSegments,
+      displaySegments,
+      isRecording,
+      note.id,
+      onLiveSpeakerLock,
+      persistDisplaySegments,
+      refreshSpeakerProfiles,
+    ]
+  );
+
+  const handleConfirmSuggestion = useCallback(
+    async (speakerId: string, suggestedName: string, profileId: number) => {
+      await handleMapSpeaker(speakerId, suggestedName, null, profileId);
+    },
+    [handleMapSpeaker]
+  );
+
+  const handleAttachSpeakerEmail = useCallback(
+    async (profileId: number, email: string | null) => {
+      const result = await window.electronAPI?.attachSpeakerEmail?.(profileId, email);
+      if (result?.success) {
+        refreshSpeakerProfiles();
+      }
+    },
+    [refreshSpeakerProfiles]
+  );
+
+  const handleDismissSuggestion = useCallback(
+    async (speakerId: string) => {
+      const currentSegments = displaySegments.map((s) =>
+        s.speaker === speakerId
+          ? applyTranscriptSpeakerPatch(s, {
+              suggestedName: undefined,
+              suggestedProfileId: undefined,
+            })
+          : s
+      );
+      await persistDisplaySegments(currentSegments, !!diarizedSegments || !isRecording);
+    },
+    [displaySegments, diarizedSegments, isRecording, persistDisplaySegments]
+  );
+
+  const [selectedSegmentIds, setSelectedSegmentIds] = useState<Set<string>>(new Set());
+  const [selectionNoteId, setSelectionNoteId] = useState(note.id);
+  if (selectionNoteId !== note.id) {
+    setSelectionNoteId(note.id);
+    setSelectedSegmentIds(new Set());
+  }
+
+  const handleToggleSelect = useCallback((segmentId: string) => {
+    setSelectedSegmentIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(segmentId)) next.delete(segmentId);
+      else next.add(segmentId);
+      return next;
+    });
+  }, []);
+
+  const handleClearSelection = useCallback(() => {
+    setSelectedSegmentIds(new Set());
+  }, []);
+
+  useEffect(() => {
+    if (selectedSegmentIds.size === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") handleClearSelection();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedSegmentIds.size, handleClearSelection]);
+
+  const handleBulkAssignName = useCallback(
+    async (displayName: string, _email?: string | null, profileId?: number) => {
+      if (!selectedSegmentIds.size) return;
+      const nextSegments = displaySegments.map((segment) =>
+        selectedSegmentIds.has(segment.id)
+          ? lockTranscriptSpeaker(segment, {
+              speakerName: displayName,
+              speakerIsPlaceholder: false,
+              suggestedName: undefined,
+              suggestedProfileId: profileId ?? undefined,
+            })
+          : segment
+      );
+      await persistDisplaySegments(nextSegments);
+      handleClearSelection();
+    },
+    [displaySegments, selectedSegmentIds, persistDisplaySegments, handleClearSelection]
+  );
+
   const handleTitleInput = useCallback(() => {
     if (titleRef.current) {
       const text = titleRef.current.textContent || "";
-      onTitleChange(text);
+      onTitleChange(note.id, text);
     }
-  }, [onTitleChange]);
+  }, [note.id, onTitleChange]);
 
   const handleTitleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      textareaRef.current?.focus();
+      editorRef.current?.commands.focus();
     }
   }, []);
 
@@ -429,337 +709,609 @@ export default function NoteEditor({
     document.execCommand("insertText", false, text);
   }, []);
 
-  const handleStartRecording = useCallback(() => {
-    if (textareaRef.current) {
-      syncSelectionRefs(textareaRef.current.selectionStart, textareaRef.current.selectionEnd);
-    }
-    onStartRecording();
-  }, [onStartRecording, syncSelectionRefs]);
-
+  const prevRecordingRef = useRef(false);
   useEffect(() => {
     if (isRecording && !prevRecordingRef.current) {
-      const selStart = cursorPosRef.current;
-      const selEnd = selectionEndRef.current;
-      dictationRef.current = {
-        start: selStart,
-        partialStart: selStart,
-        end: selEnd,
-        committedChars: 0,
-      };
-      if (viewMode === "enhanced") setViewMode("raw");
-    }
-    if (!isRecording && prevRecordingRef.current) {
-      // Only clear if no progressive text was inserted (non-streaming case).
-      // For streaming, keep dictationRef alive so the final transcript replaces
-      // the partial zone instead of inserting a duplicate at cursor.
-      const range = dictationRef.current;
-      if (range && range.partialStart === range.start && range.end === range.start) {
-        dictationRef.current = null;
-      }
+      scheduleUiUpdate(() => setViewMode("transcript"));
     }
     prevRecordingRef.current = isRecording;
-  }, [isRecording]);
+  }, [isRecording, scheduleUiUpdate]);
 
-  // Partial effect: only replace the active partial zone [partialStart, end].
-  // Committed text before partialStart is untouched — users can edit it freely.
-  useEffect(() => {
-    if (!partialTranscript || !dictationRef.current) return;
+  const contentScrollRef = useRef<HTMLDivElement>(null);
 
-    const { partialStart, end } = dictationRef.current;
-    const hasCommitted = partialStart > dictationRef.current.start;
-    const textToInsert = (hasCommitted ? " " : "") + partialTranscript;
-    const newEnd = partialStart + textToInsert.length;
+  const getActiveScroller = useCallback((root: HTMLDivElement): HTMLElement | null => {
+    const candidates = [root, ...Array.from(root.querySelectorAll<HTMLElement>("*"))].filter(
+      (el) => el.scrollHeight - el.clientHeight > 2
+    );
+    if (!candidates.length) return null;
+    return candidates.reduce((a, b) =>
+      b.scrollHeight - b.clientHeight > a.scrollHeight - a.clientHeight ? b : a
+    );
+  }, []);
 
-    replaceContentRange(partialStart, end, textToInsert);
-    dictationRef.current.end = newEnd;
-  }, [partialTranscript, replaceContentRange]); // note.content intentionally excluded
+  const floatingChatPanelRef = useCallback(
+    (panel: HTMLDivElement | null): (() => void) | undefined => {
+      const container = panel?.parentElement;
+      const contentRoot = contentScrollRef.current;
+      if (!panel || !container || !contentRoot) return undefined;
 
-  // Streaming commit: a Deepgram segment was finalized. Replace the partial zone
-  // with the committed text and advance partialStart for the next utterance.
-  useEffect(() => {
-    if (streamingCommit == null || !dictationRef.current) return;
-
-    const { partialStart, end } = dictationRef.current;
-    const newPartialStart = partialStart + streamingCommit.length;
-
-    replaceContentRange(partialStart, end, streamingCommit);
-    dictationRef.current.partialStart = newPartialStart;
-    dictationRef.current.end = newPartialStart;
-    dictationRef.current.committedChars += streamingCommit.length;
-
-    onStreamingCommitConsumed();
-  }, [streamingCommit, onStreamingCommitConsumed, replaceContentRange]); // note.content intentionally excluded
-
-  // Final transcript (on recording stop).
-  useEffect(() => {
-    if (finalTranscript == null) return;
-
-    const range = dictationRef.current;
-    if (!range) {
-      // Non-streaming: insert at cursor with separator
-      const pos = cursorPosRef.current;
-      const before = contentRef.current.slice(0, pos);
-      const after = contentRef.current.slice(pos);
-      const separator = before && !before.endsWith("\n") ? "\n" : "";
-      const newContent = before + separator + finalTranscript + after;
-      commitContentChange(newContent);
-      onFinalTranscriptConsumed();
-      return;
-    }
-
-    // Streaming: committed text is already in the note. Only finalize the
-    // remaining partial zone with the tail of the final transcript.
-    const { partialStart, end, committedChars } = range;
-    const remainingFinal = finalTranscript.slice(committedChars);
-
-    // If partial zone is empty and nothing new to insert, just clean up
-    if (partialStart === end && !remainingFinal.trim()) {
-      dictationRef.current = null;
-      onFinalTranscriptConsumed();
-      return;
-    }
-
-    replaceContentRange(partialStart, end, remainingFinal);
-    dictationRef.current = null;
-    onFinalTranscriptConsumed();
-  }, [finalTranscript, commitContentChange, onFinalTranscriptConsumed, replaceContentRange]); // note.content intentionally excluded
-
-  // Safety: clear dictation range when processing ends without a final transcript
-  // (e.g. cancelled recording with no captured text). Declared after the final
-  // transcript effect so it runs second if both trigger in the same render.
-  const prevDictationProcessingRef = useRef(false);
-  useEffect(() => {
-    if (prevDictationProcessingRef.current && !isProcessing && dictationRef.current) {
-      dictationRef.current = null;
-    }
-    prevDictationProcessingRef.current = isProcessing;
-  }, [isProcessing]);
-
-  const handleSelect = () => {
-    if (textareaRef.current && document.activeElement === textareaRef.current) {
-      if (suppressSelectionCaptureRef.current) return;
-      captureUserSelection(textareaRef.current.selectionStart, textareaRef.current.selectionEnd);
-    }
-  };
-
-  const handleContentChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const newValue = e.target.value;
-
-    // Skip no-op changes (e.g. React controlled-component echo during dictation)
-    if (newValue === note.content) return;
-
-    if (dictationRef.current) {
-      const beforeInput = beforeInputSelectionRef.current;
-      beforeInputSelectionRef.current = null;
-
-      if (beforeInput) {
-        const replacedLength = beforeInput.end - beforeInput.start;
-        const insertLength = newValue.length - (note.content.length - replacedLength);
-        const range = dictationRef.current;
-
-        const nextStart = mapIndexThroughUserEdit(
-          range.start,
-          beforeInput.start,
-          beforeInput.end,
-          insertLength
-        );
-        const nextPartialStart = mapIndexThroughUserEdit(
-          range.partialStart,
-          beforeInput.start,
-          beforeInput.end,
-          insertLength
-        );
-        const nextEnd = mapIndexThroughUserEdit(
-          range.end,
-          beforeInput.start,
-          beforeInput.end,
-          insertLength
-        );
-
-        range.start = Math.min(nextStart, newValue.length);
-        range.partialStart = Math.min(Math.max(nextPartialStart, range.start), newValue.length);
-        range.end = Math.min(Math.max(nextEnd, range.partialStart), newValue.length);
-      } else {
-        const delta = newValue.length - note.content.length;
-        const editPos = e.target.selectionStart - delta;
-        if (editPos <= dictationRef.current.start) {
-          dictationRef.current.start += delta;
-          dictationRef.current.partialStart += delta;
-          dictationRef.current.end += delta;
-        } else if (editPos <= dictationRef.current.partialStart) {
-          dictationRef.current.partialStart += delta;
-          dictationRef.current.end += delta;
-        } else if (editPos < dictationRef.current.end) {
-          dictationRef.current.end += delta;
-        }
-      }
-    }
-
-    beforeInputSelectionRef.current = null;
-    contentRef.current = newValue;
-    onContentChange(newValue);
-    captureUserSelection(e.target.selectionStart, e.target.selectionEnd);
-  };
-
-  const handleEnhancedChange = useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      enhancement?.onChange(e.target.value);
+      return observeFloatingChatLayout({
+        panel,
+        container,
+        contentRoot,
+        getActiveScroller: (): HTMLElement | null => getActiveScroller(contentRoot),
+      });
     },
-    [enhancement]
+    [getActiveScroller]
   );
 
-  const wordCount = useMemo(() => {
-    const trimmed = note.content.trim();
-    return trimmed ? trimmed.split(/\s+/).length : 0;
-  }, [note.content]);
+  const handleContentChange = useCallback(
+    (newValue: string) => {
+      onContentChange(note.id, newValue);
+    },
+    [note.id, onContentChange]
+  );
+
+  const handleEnhancedChange = useCallback(
+    (value: string) => {
+      enhancement?.onChange(note.id, value);
+    },
+    [enhancement, note.id]
+  );
+
+  const handleAskSubmit = useCallback(
+    (text: string) => {
+      if (chatMode === "hidden") {
+        setChatMode("floating");
+      }
+      embeddedChat.sendMessage(text);
+    },
+    [chatMode, embeddedChat]
+  );
+
+  const handleChatInputFocus = useCallback(() => {
+    if (chatMode === "hidden") {
+      setChatMode("floating");
+    }
+  }, [chatMode]);
+
+  // Apply the newer cloud copy over the local edits, keeping the note's
+  // current local placement.
+  const handleConflictRefresh = useCallback(async () => {
+    if (!conflict) return;
+    // Cancel any queued autosave FIRST: a pending debounced save holds the
+    // pre-refresh buffer and would both block the editor resync and clobber
+    // the cloud copy in SQLite a second later.
+    onCancelPendingSaves?.(note.id);
+    const fresh = await window.electronAPI.upsertNoteFromCloud?.(
+      conflict as unknown as Record<string, unknown>,
+      note.folder_id,
+      note.space_id
+    );
+    clearNoteConflict(note.client_note_id);
+    // With no save pending, the owner's external-update resync applies the
+    // fresh copy to the visible editor buffer.
+    if (fresh) updateNoteInStore(fresh);
+  }, [conflict, note.client_note_id, note.folder_id, note.id, note.space_id, onCancelPendingSaves]);
+
+  // Keep the local edits, overwriting the cloud revision the user just saw.
+  // Advancing the base first is what lets the next push succeed instead of
+  // 409ing against the same conflict and re-raising the banner.
+  const handleConflictKeep = useCallback(() => {
+    if (conflict) void window.electronAPI.setNoteCloudBase?.(note.id, conflict.updated_at);
+    clearNoteConflict(note.client_note_id);
+  }, [conflict, note.id, note.client_note_id]);
 
   const noteDate = formatNoteDate(note.created_at);
+  const shortDate = formatShortDate(note.created_at);
 
   return (
-    <div className="flex flex-col h-full min-h-0">
-      <div className="px-5 pt-4 pb-0">
-        <div
-          ref={titleRef}
-          contentEditable
-          suppressContentEditableWarning
-          onInput={handleTitleInput}
-          onKeyDown={handleTitleKeyDown}
-          onPaste={handleTitlePaste}
-          data-placeholder={t("notes.editor.untitled")}
-          className="text-base font-semibold text-foreground bg-transparent outline-none tracking-[-0.01em] empty:before:content-[attr(data-placeholder)] empty:before:text-foreground/15 empty:before:pointer-events-none"
-          role="textbox"
-          aria-label={t("notes.editor.noteTitle")}
-        />
-        <div className="flex items-center mt-1">
-          <div className="flex items-center text-xs text-foreground/50 dark:text-foreground/20 min-w-0">
-            {noteDate && <span>{noteDate}</span>}
-            {noteDate && (isSaving || wordCount > 0) && <span className="mx-1.5">&middot;</span>}
-            <span className="tabular-nums flex items-center gap-1 shrink-0">
-              {isSaving && <Loader2 size={8} className="animate-spin" />}
-              {isSaving
-                ? t("notes.editor.saving")
-                : wordCount > 0
-                  ? t("notes.editor.wordsCount", { count: wordCount })
-                  : ""}
-            </span>
-          </div>
-          <div className="flex-1" />
-          <div className="flex items-center gap-1">
-            {enhancement && (
-              <div
-                ref={segmentContainerRef}
-                className="relative flex items-center shrink-0 rounded-md bg-foreground/3 dark:bg-white/3 p-0.5"
+    <div className="flex h-full min-h-0">
+      <div className="flex-1 min-w-0 flex flex-col">
+        <div className="px-5 pt-4 pb-0">
+          <div
+            ref={titleRef}
+            contentEditable={canEditNote}
+            suppressContentEditableWarning
+            onInput={handleTitleInput}
+            onKeyDown={handleTitleKeyDown}
+            onPaste={handleTitlePaste}
+            data-placeholder={t("notes.editor.untitled")}
+            className="text-base font-semibold text-foreground bg-transparent outline-none tracking-[-0.01em] empty:before:content-[attr(data-placeholder)] empty:before:text-foreground/15 empty:before:pointer-events-none"
+            role="textbox"
+            aria-label={t("notes.editor.noteTitle")}
+          />
+          <div className="flex items-center gap-2 mt-1.5">
+            {shortDate && (
+              <span
+                className="inline-flex items-center gap-1.5 text-[11px] text-foreground/50 dark:text-foreground/35"
+                title={noteDate}
               >
-                <div
-                  className="absolute top-0.5 left-0 rounded bg-background dark:bg-surface-2 shadow-sm transition-[width,height,transform,opacity] duration-200 ease-out pointer-events-none"
-                  style={indicatorStyle}
-                />
-                <button
-                  data-segment-button
-                  onClick={() => setViewMode("raw")}
-                  className={cn(
-                    "relative z-1 px-1.5 h-5 rounded text-xs font-medium transition-colors duration-150 flex items-center gap-1",
-                    viewMode === "raw"
-                      ? "text-foreground/60"
-                      : "text-foreground/25 hover:text-foreground/40"
-                  )}
-                >
-                  <AlignLeft size={10} />
-                  {t("notes.editor.raw")}
-                </button>
-                <button
-                  data-segment-button
-                  onClick={() => setViewMode("enhanced")}
-                  className={cn(
-                    "relative z-1 px-1.5 h-5 rounded text-xs font-medium transition-colors duration-150 flex items-center gap-1",
-                    viewMode === "enhanced"
-                      ? "text-foreground/60"
-                      : "text-foreground/25 hover:text-foreground/40"
-                  )}
-                >
-                  <Sparkles size={9} />
-                  {t("notes.editor.enhanced")}
-                  {enhancement.isStale && (
-                    <span
-                      className="w-1 h-1 rounded-full bg-amber-400/60"
-                      title={t("notes.editor.staleIndicator")}
-                    />
-                  )}
-                </button>
-              </div>
+                <Calendar size={11} className="shrink-0" />
+                {shortDate}
+              </span>
             )}
-            {canStream && (
-              <button
-                onClick={handleLiveToggle}
-                className={cn(
-                  "shrink-0 h-6 px-1.5 flex items-center gap-1 rounded-md text-xs font-medium transition-colors duration-150",
-                  liveMode
-                    ? "bg-primary/8 text-primary/70 hover:bg-primary/12 dark:bg-primary/12 dark:text-primary/80"
-                    : "bg-foreground/3 dark:bg-white/3 text-foreground/25 hover:text-foreground/40 hover:bg-foreground/6 dark:hover:bg-white/6"
+            {calendarEventName && (
+              <span className="inline-flex items-center gap-1.5 text-[11px] text-foreground/50 dark:text-foreground/35">
+                <LinkIcon size={11} className="shrink-0" />
+                <span className="truncate max-w-40">{calendarEventName}</span>
+              </span>
+            )}
+            <NoteParticipants noteId={note.id} participants={parsedParticipants} />
+            {isTeamNote && space && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => navigateToContainer(space.id, null)}
+                  className={CHIP_BUTTON_CLASS}
+                >
+                  {space.emoji ? (
+                    <span className="text-[11px] leading-none shrink-0" aria-hidden="true">
+                      {space.emoji}
+                    </span>
+                  ) : (
+                    <Users size={11} className="shrink-0" />
+                  )}
+                  <span className="truncate max-w-32">{space.name}</span>
+                </button>
+                {folders && onMoveToFolder && (canMoveToFolders || folderName) && (
+                  <span aria-hidden="true" className="text-[11px] text-foreground/25">
+                    /
+                  </span>
                 )}
-                aria-label={t("notes.editor.live")}
-              >
-                <Radio size={9} />
-                {t("notes.editor.live")}
-              </button>
+              </>
             )}
-            {onExportNote && (
-              <DropdownMenu>
+            {folders && onMoveToFolder && !canMoveToFolders && folderName && (
+              <span className={cn(CHIP_BUTTON_CLASS, "cursor-default")}>
+                <FolderOpen size={11} className="shrink-0" />
+                {folderName}
+              </span>
+            )}
+            {folders && onMoveToFolder && canMoveToFolders && (
+              <DropdownMenu
+                onOpenChange={(open) => {
+                  if (!open) {
+                    setFolderSearch("");
+                    setIsCreatingFolder(false);
+                    setNewFolderName("");
+                  }
+                }}
+              >
                 <DropdownMenuTrigger asChild>
-                  <button
-                    className="shrink-0 h-6 w-6 flex items-center justify-center rounded-md bg-foreground/3 dark:bg-white/3 text-foreground/25 hover:text-foreground/40 hover:bg-foreground/6 dark:hover:bg-white/6 transition-colors duration-150"
-                    aria-label={t("notes.editor.export")}
-                  >
-                    <Download size={11} />
+                  <button className={CHIP_BUTTON_CLASS}>
+                    <FolderOpen size={11} className="shrink-0" />
+                    {folderName || t("notes.editor.noFolder")}
                   </button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" sideOffset={4}>
-                  <DropdownMenuItem onClick={() => onExportNote("md")} className="text-xs gap-2">
-                    <FileText size={13} className="text-foreground/40" />
-                    {t("notes.editor.asMarkdown")}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => onExportNote("txt")} className="text-xs gap-2">
-                    <FileText size={13} className="text-foreground/40" />
-                    {t("notes.editor.asPlainText")}
-                  </DropdownMenuItem>
+                <DropdownMenuContent align="start" sideOffset={6} className="min-w-44 p-1">
+                  {folders.length > 5 && (
+                    <>
+                      <div className="relative px-1.5 py-0.5">
+                        <Search
+                          size={9}
+                          className="absolute left-3.5 top-1/2 -translate-y-1/2 text-foreground/15 pointer-events-none"
+                        />
+                        <input
+                          value={folderSearch}
+                          onChange={(e) => setFolderSearch(e.target.value)}
+                          onKeyDown={(e) => e.stopPropagation()}
+                          placeholder={t("notes.context.searchFolders")}
+                          className="input-inline w-full pl-4.5 pr-1 py-0.5 text-xs text-foreground placeholder:text-foreground/15 outline-none border-none appearance-none"
+                        />
+                      </div>
+                      <DropdownMenuSeparator />
+                    </>
+                  )}
+                  <div className="overflow-y-auto max-h-48">
+                    {filteredFolders.map((folder) => {
+                      const isCurrent = folder.id === note.folder_id;
+                      return (
+                        <DropdownMenuItem
+                          key={folder.id}
+                          disabled={isCurrent}
+                          onClick={() => onMoveToFolder(note.id, folder.id)}
+                          className="text-xs gap-2 rounded-md px-2 py-1.5"
+                        >
+                          <FolderOpen size={11} className="text-foreground/30 shrink-0" />
+                          <span className="truncate flex-1">{folder.name}</span>
+                          {isCurrent && <Check size={9} className="text-primary shrink-0" />}
+                        </DropdownMenuItem>
+                      );
+                    })}
+                    {folderSearch && filteredFolders.length === 0 && (
+                      <p className="text-xs text-foreground/20 text-center py-1.5">
+                        {t("notes.context.noResults")}
+                      </p>
+                    )}
+                  </div>
+                  {onCreateFolderAndMove && (
+                    <>
+                      <DropdownMenuSeparator />
+                      {isCreatingFolder ? (
+                        <div className="px-1">
+                          <input
+                            autoFocus
+                            value={newFolderName}
+                            onChange={(e) => setNewFolderName(e.target.value)}
+                            onKeyDown={(e) => {
+                              e.stopPropagation();
+                              if (e.key === "Enter" && newFolderName.trim()) {
+                                onCreateFolderAndMove(note.id, newFolderName.trim());
+                                setNewFolderName("");
+                                setIsCreatingFolder(false);
+                              }
+                              if (e.key === "Escape") {
+                                setIsCreatingFolder(false);
+                                setNewFolderName("");
+                              }
+                            }}
+                            placeholder={t("notes.folders.folderName")}
+                            className="input-inline w-full px-2 py-1.5 rounded-md bg-transparent text-xs text-foreground placeholder:text-foreground/20 outline-none border-none appearance-none"
+                          />
+                        </div>
+                      ) : (
+                        <DropdownMenuItem
+                          onSelect={(e) => {
+                            e.preventDefault();
+                            setIsCreatingFolder(true);
+                          }}
+                          className="text-xs gap-2 rounded-md px-2 py-1.5 text-foreground/40"
+                        >
+                          <Plus size={10} />
+                          {t("notes.context.newFolder")}
+                        </DropdownMenuItem>
+                      )}
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
+            {isTeamNote && space?.cloud_space_id && (
+              <button
+                type="button"
+                onClick={() => setMembersDialogOpen(true)}
+                aria-label={t("notes.spaces.teamsMembers.title", { space: space.name })}
+                className={CHIP_BUTTON_CLASS}
+              >
+                <Users size={11} className="shrink-0" />
+                {/* member_count tracks explicit rosters only — the audience always includes the viewer */}
+                {Math.max(1, space.member_count ?? 1)}
+              </button>
+            )}
+            {isSaving && (
+              <span className="inline-flex items-center gap-1 text-[11px] text-foreground/30 dark:text-foreground/15 tabular-nums">
+                <Loader2 size={8} className="animate-spin" />
+                {t("notes.editor.saving")}
+              </span>
+            )}
+            <div className="flex-1" />
+            <div className="flex items-center gap-1">
+              {(enhancement || hasMeetingTranscript || hasChatSegments || isRecording) && (
+                <div
+                  ref={segmentContainerRef}
+                  className="relative flex items-center shrink-0 rounded-md bg-foreground/3 dark:bg-white/3 p-0.5"
+                >
+                  <div
+                    className="absolute top-0.5 left-0 rounded bg-background dark:bg-surface-2 shadow-sm transition-[width,height,transform,opacity] duration-200 ease-out pointer-events-none"
+                    style={indicatorStyle}
+                  />
+                  {(hasMeetingTranscript || hasChatSegments || isRecording) && (
+                    <button
+                      data-segment-button
+                      data-segment-value="transcript"
+                      onClick={() => setViewMode("transcript")}
+                      className={cn(
+                        "relative z-1 px-1.5 h-5 rounded text-xs font-medium transition-colors duration-150 flex items-center gap-1",
+                        viewMode === "transcript"
+                          ? "text-foreground/60"
+                          : "text-foreground/25 hover:text-foreground/40"
+                      )}
+                    >
+                      <MessageSquareText size={10} />
+                      {t("notes.editor.transcript")}
+                    </button>
+                  )}
+                  <button
+                    data-segment-button
+                    data-segment-value="raw"
+                    onClick={() => setViewMode("raw")}
+                    className={cn(
+                      "relative z-1 px-1.5 h-5 rounded text-xs font-medium transition-colors duration-150 flex items-center gap-1",
+                      viewMode === "raw"
+                        ? "text-foreground/60"
+                        : "text-foreground/25 hover:text-foreground/40"
+                    )}
+                  >
+                    <AlignLeft size={10} />
+                    {t("notes.editor.notes")}
+                  </button>
+                  {enhancement && (
+                    <button
+                      data-segment-button
+                      data-segment-value="enhanced"
+                      onClick={() => setViewMode("enhanced")}
+                      className={cn(
+                        "relative z-1 px-1.5 h-5 rounded text-xs font-medium transition-colors duration-150 flex items-center gap-1",
+                        viewMode === "enhanced"
+                          ? "text-foreground/60"
+                          : "text-foreground/25 hover:text-foreground/40"
+                      )}
+                    >
+                      <Sparkles size={9} />
+                      {t("notes.editor.enhanced")}
+                      {enhancement.isStale && (
+                        <span
+                          className="w-1 h-1 rounded-full bg-amber-400/60"
+                          title={t("notes.editor.staleIndicator")}
+                        />
+                      )}
+                    </button>
+                  )}
+                </div>
+              )}
+              {canShare && (
+                <button
+                  type="button"
+                  onClick={() => setShareDialogOpen(true)}
+                  className={cn(
+                    "shrink-0 h-6 w-6 flex items-center justify-center rounded-md",
+                    "bg-foreground/4 dark:bg-white/5",
+                    "hover:bg-foreground/8 dark:hover:bg-white/10",
+                    "active:bg-foreground/12 dark:active:bg-white/15",
+                    "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                    "transition-colors duration-150"
+                  )}
+                  aria-label={t("noteEditor.share.button")}
+                >
+                  <Share2
+                    size={11}
+                    className={cn(
+                      "transition-colors",
+                      isShared
+                        ? "text-blue-600 dark:text-blue-400"
+                        : "text-foreground/50 dark:text-foreground/40"
+                    )}
+                  />
+                </button>
+              )}
+              {(onExportNote || onExportTranscript) && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      className="shrink-0 h-6 w-6 flex items-center justify-center rounded-md bg-foreground/4 dark:bg-white/5 text-foreground/50 dark:text-foreground/40 hover:text-foreground/70 hover:bg-foreground/8 dark:hover:text-foreground/60 dark:hover:bg-white/8 transition-colors duration-150"
+                      aria-label={t("notes.editor.export")}
+                    >
+                      <Download size={11} />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" sideOffset={4}>
+                    {viewMode === "transcript" && onExportTranscript ? (
+                      <>
+                        <DropdownMenuItem
+                          onClick={() => onExportTranscript("txt")}
+                          className="text-xs gap-2"
+                        >
+                          <FileText size={13} className="text-foreground/40" />
+                          {t("notes.editor.asTranscriptText")}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => onExportTranscript("srt")}
+                          className="text-xs gap-2"
+                        >
+                          <FileText size={13} className="text-foreground/40" />
+                          {t("notes.editor.asSubtitles")}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => onExportTranscript("md")}
+                          className="text-xs gap-2"
+                        >
+                          <FileText size={13} className="text-foreground/40" />
+                          {t("notes.editor.asTranscriptMarkdown")}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => onExportTranscript("json")}
+                          className="text-xs gap-2"
+                        >
+                          <FileText size={13} className="text-foreground/40" />
+                          {t("notes.editor.asJson")}
+                        </DropdownMenuItem>
+                      </>
+                    ) : (
+                      <>
+                        <DropdownMenuItem
+                          onClick={() => onExportNote?.("md")}
+                          className="text-xs gap-2"
+                        >
+                          <FileText size={13} className="text-foreground/40" />
+                          {t("notes.editor.asMarkdown")}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => onExportNote?.("txt")}
+                          className="text-xs gap-2"
+                        >
+                          <FileText size={13} className="text-foreground/40" />
+                          {t("notes.editor.asPlainText")}
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+            </div>
           </div>
         </div>
-      </div>
 
-      <div className="flex-1 relative min-h-0">
-        <div className="h-full overflow-y-auto">
-          {viewMode === "enhanced" && enhancement ? (
-            <MarkdownTextarea value={enhancement.content} onChange={handleEnhancedChange} />
-          ) : (
-            <MarkdownTextarea
-              value={note.content}
-              onChange={handleContentChange}
-              onSelect={handleSelect}
-              textareaRef={textareaRef}
-              placeholder={t("notes.editor.startWriting")}
-              disabled={actionProcessingState === "processing"}
+        {conflict && (
+          <div
+            className={cn(
+              "flex items-center gap-2 px-5 h-8 mt-2 shrink-0",
+              "bg-amber-400/5 dark:bg-amber-400/[0.07]",
+              "border-y border-amber-400/15 dark:border-amber-400/20",
+              "animate-in slide-in-from-top-2 duration-300"
+            )}
+          >
+            <span className="w-1 h-1 rounded-full bg-amber-400/60 shrink-0" />
+            <p className="text-[11px] text-foreground/50 flex-1 truncate">
+              {t("notes.spaces.conflictBanner")}
+              {conflictEditorName && (
+                <span className="text-foreground/30">
+                  {" "}
+                  {t("notes.spaces.editedBy", {
+                    name: conflictEditorName,
+                    time: formatRelativeTime(conflict.updated_at, t),
+                  })}
+                </span>
+              )}
+            </p>
+            <button
+              onClick={handleConflictRefresh}
+              className="text-[11px] font-medium text-foreground/50 hover:text-foreground/70 transition-colors shrink-0 px-1 -mx-1 rounded outline-none focus-visible:ring-1 focus-visible:ring-ring/30"
+            >
+              {t("notes.spaces.conflictRefresh")}
+            </button>
+            <button
+              onClick={handleConflictKeep}
+              className="text-[11px] font-medium text-foreground/35 hover:text-foreground/55 transition-colors shrink-0 px-1 -mx-1 rounded outline-none focus-visible:ring-1 focus-visible:ring-ring/30"
+            >
+              {t("notes.spaces.conflictKeep")}
+            </button>
+          </div>
+        )}
+
+        <div className="flex-1 relative min-h-0">
+          <div ref={contentScrollRef} className="h-full overflow-y-auto">
+            {viewMode === "transcript" && (hasChatSegments || isRecording) ? (
+              isRecording ? (
+                <LiveMeetingTranscriptChat
+                  speakerMappings={speakerMappings}
+                  speakerProfiles={speakerProfiles}
+                  participants={parsedParticipants}
+                  isDiarizing={isDiarizing}
+                  sessionDiarizationEnabled={sessionDiarizationEnabled}
+                  sessionExpectedCount={sessionExpectedCount}
+                  userTouchedStepper={userTouchedStepper}
+                  onSetSessionDiarizationEnabled={onSetSessionDiarizationEnabled}
+                  onSetSessionExpectedCount={onSetSessionExpectedCount}
+                  onMapSpeaker={handleMapSpeaker}
+                  onConfirmSuggestion={handleConfirmSuggestion}
+                  onDismissSuggestion={handleDismissSuggestion}
+                  onAttachSpeakerEmail={handleAttachSpeakerEmail}
+                />
+              ) : (
+                <MeetingTranscriptChat
+                  segments={displaySegments}
+                  speakerMappings={speakerMappings}
+                  speakerProfiles={knownSpeakers}
+                  participants={parsedParticipants}
+                  isDiarizing={isDiarizing}
+                  sessionDiarizationEnabled={sessionDiarizationEnabled}
+                  sessionExpectedCount={sessionExpectedCount}
+                  userTouchedStepper={userTouchedStepper}
+                  onSetSessionDiarizationEnabled={onSetSessionDiarizationEnabled}
+                  onSetSessionExpectedCount={onSetSessionExpectedCount}
+                  onMapSpeaker={handleMapSpeaker}
+                  onConfirmSuggestion={handleConfirmSuggestion}
+                  onDismissSuggestion={handleDismissSuggestion}
+                  onAttachSpeakerEmail={handleAttachSpeakerEmail}
+                  selectedSegmentIds={selectedSegmentIds}
+                  onToggleSelect={handleToggleSelect}
+                />
+              )
+            ) : viewMode === "transcript" && hasMeetingTranscript ? (
+              <RichTextEditor value={note.transcript || ""} disabled />
+            ) : viewMode === "enhanced" && enhancement ? (
+              <RichTextEditor
+                value={enhancement.content}
+                onChange={handleEnhancedChange}
+                disabled={!canEditNote}
+                mentionPeople={mentionPeople}
+              />
+            ) : (
+              <RichTextEditor
+                value={note.content}
+                onChange={handleContentChange}
+                editorRef={editorRef}
+                placeholder={t("notes.editor.startWriting")}
+                disabled={!canEditNote || actionProcessingState === "processing"}
+                mentionPeople={mentionPeople}
+              />
+            )}
+          </div>
+          <ActionProcessingOverlay
+            state={actionProcessingState ?? "idle"}
+            actionName={actionName ?? null}
+          />
+          <div
+            className="absolute bottom-0 left-0 right-0 h-20 pointer-events-none"
+            style={{
+              background: "linear-gradient(to bottom, transparent, var(--color-background))",
+            }}
+          />
+          {!isRecording && selectedSegmentIds.size > 0 && (
+            <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-20 pointer-events-auto">
+              <SelectionBar
+                count={selectedSegmentIds.size}
+                onClear={handleClearSelection}
+                speakerProfiles={knownSpeakers}
+                participants={parsedParticipants}
+                onAssignName={handleBulkAssignName}
+                t={t}
+              />
+            </div>
+          )}
+          <NoteBottomBar
+            isRecording={isRecording}
+            isProcessing={isProcessing}
+            recordingDisabled={!recordingAllowed}
+            onStartRecording={onStartRecording}
+            onStopRecording={onStopRecording}
+            onAskSubmit={handleAskSubmit}
+            onInputFocus={handleChatInputFocus}
+            canRecord={canEditNote}
+            actionPicker={isRecording || !canEditNote ? undefined : actionPicker}
+            hideInput={chatMode !== "hidden"}
+          />
+          {chatMode === "floating" && (
+            <EmbeddedChat
+              mode="floating"
+              floatingPanelRef={floatingChatPanelRef}
+              onModeChange={setChatMode}
+              messages={embeddedChat.messages}
+              agentState={embeddedChat.agentState}
+              onTextSubmit={embeddedChat.sendMessage}
+              onCancel={embeddedChat.cancelStream}
+              noteConversations={embeddedChat.noteConversations}
+              activeConversationId={embeddedChat.activeConversationId}
+              onSwitchConversation={embeddedChat.switchConversation}
+              onNewChat={embeddedChat.startNewChat}
             />
           )}
         </div>
-        <ActionProcessingOverlay
-          state={actionProcessingState ?? "idle"}
-          actionName={actionName ?? null}
-        />
-        <div
-          className="absolute bottom-0 left-0 right-0 h-24 pointer-events-none"
-          style={{ background: "linear-gradient(to bottom, transparent, var(--color-background))" }}
-        />
-        <DictationWidget
-          isRecording={isRecording}
-          isProcessing={isProcessing}
-          onStart={handleStartRecording}
-          onStop={onStopRecording}
-          actionPicker={actionPicker}
-        />
       </div>
+      {chatMode === "sidebar" && (
+        <EmbeddedChat
+          mode="sidebar"
+          onModeChange={setChatMode}
+          messages={embeddedChat.messages}
+          agentState={embeddedChat.agentState}
+          onTextSubmit={embeddedChat.sendMessage}
+          onCancel={embeddedChat.cancelStream}
+          noteConversations={embeddedChat.noteConversations}
+          activeConversationId={embeddedChat.activeConversationId}
+          onSwitchConversation={embeddedChat.switchConversation}
+          onNewChat={embeddedChat.startNewChat}
+        />
+      )}
+      {canShare && (
+        <ShareNoteDialog open={shareDialogOpen} onOpenChange={setShareDialogOpen} note={note} />
+      )}
+      {isTeamNote && space?.cloud_space_id && (
+        <SpaceMembersDialog
+          space={space}
+          open={membersDialogOpen}
+          onOpenChange={setMembersDialogOpen}
+        />
+      )}
     </div>
   );
 }

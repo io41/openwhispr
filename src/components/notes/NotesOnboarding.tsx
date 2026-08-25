@@ -1,9 +1,14 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useTranslation } from "react-i18next";
-import { Sparkles, Plus, ChevronRight, Zap, Loader2, Check } from "lucide-react";
+import { Sparkles, Plus, ChevronRight, Zap, Loader2, Check, Monitor } from "lucide-react";
 import { Button } from "../ui/button";
 import { cn } from "../lib/utils";
-import { useSettingsStore } from "../../stores/settingsStore";
+import {
+  selectPolicyEffectiveSettings,
+  selectResolvedLLMConfig,
+  useSettingsStore,
+} from "../../stores/settingsStore";
 import { useNotesOnboarding } from "../../hooks/useNotesOnboarding";
 import {
   useActions,
@@ -15,6 +20,9 @@ import { notesInputClass, notesTextareaClass } from "./shared";
 import { useDialogs } from "../../hooks/useDialogs";
 import { AlertDialog } from "../ui/dialog";
 import ReasoningModelSelector from "../ReasoningModelSelector";
+import { useSystemAudioPermission } from "../../hooks/useSystemAudioPermission";
+import { canManageSystemAudioInApp } from "../../utils/systemAudioAccess";
+import { usePolicySnapshot } from "../../hooks/usePolicy";
 
 interface NotesOnboardingProps {
   onComplete: () => void;
@@ -32,24 +40,40 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
   const [isSaving, setIsSaving] = useState(false);
   const [justCreated, setJustCreated] = useState(false);
 
-  const reasoningModel = useSettingsStore((s) => s.reasoningModel);
-  const setReasoningModel = useSettingsStore((s) => s.setReasoningModel);
-  const reasoningProvider = useSettingsStore((s) => s.reasoningProvider);
-  const setReasoningProvider = useSettingsStore((s) => s.setReasoningProvider);
-  const cloudReasoningBaseUrl = useSettingsStore((s) => s.cloudReasoningBaseUrl);
-  const setCloudReasoningBaseUrl = useSettingsStore((s) => s.setCloudReasoningBaseUrl);
-  const openaiApiKey = useSettingsStore((s) => s.openaiApiKey);
-  const setOpenaiApiKey = useSettingsStore((s) => s.setOpenaiApiKey);
-  const anthropicApiKey = useSettingsStore((s) => s.anthropicApiKey);
-  const setAnthropicApiKey = useSettingsStore((s) => s.setAnthropicApiKey);
-  const geminiApiKey = useSettingsStore((s) => s.geminiApiKey);
-  const setGeminiApiKey = useSettingsStore((s) => s.setGeminiApiKey);
-  const groqApiKey = useSettingsStore((s) => s.groqApiKey);
-  const setGroqApiKey = useSettingsStore((s) => s.setGroqApiKey);
-  const customReasoningApiKey = useSettingsStore((s) => s.customReasoningApiKey);
-  const setCustomReasoningApiKey = useSettingsStore((s) => s.setCustomReasoningApiKey);
+  const policyState = usePolicySnapshot();
+  const cleanupConfig = useSettingsStore(
+    useShallow((settings) =>
+      selectResolvedLLMConfig(
+        selectPolicyEffectiveSettings(settings, policyState),
+        "dictationCleanup"
+      )
+    )
+  );
+  const setCleanupModel = useSettingsStore((s) => s.setCleanupModel);
+  const setCleanupProvider = useSettingsStore((s) => s.setCleanupProvider);
+  const setCleanupMode = useSettingsStore((s) => s.setCleanupMode);
+  const setCleanupCloudBaseUrl = useSettingsStore((s) => s.setCleanupCloudBaseUrl);
+  const setCleanupCustomApiKey = useSettingsStore((s) => s.setCleanupCustomApiKey);
 
   const { alertDialog, hideAlertDialog } = useDialogs();
+  const {
+    granted: systemAudioGranted,
+    mode: systemAudioMode,
+    request: requestSystemAudio,
+  } = useSystemAudioPermission();
+  const [isRequestingSystemAudio, setIsRequestingSystemAudio] = useState(false);
+  const shouldShowSystemAudioPermission = canManageSystemAudioInApp({
+    mode: systemAudioMode,
+  });
+
+  const handleGrantSystemAudio = useCallback(async () => {
+    setIsRequestingSystemAudio(true);
+    try {
+      await requestSystemAudio();
+    } finally {
+      setIsRequestingSystemAudio(false);
+    }
+  }, [requestSystemAudio]);
 
   useEffect(() => {
     initializeActions();
@@ -146,25 +170,66 @@ export default function NotesOnboarding({ onComplete }: NotesOnboardingProps) {
                 </p>
 
                 <ReasoningModelSelector
-                  reasoningModel={reasoningModel}
-                  setReasoningModel={setReasoningModel}
-                  localReasoningProvider={reasoningProvider}
-                  setLocalReasoningProvider={setReasoningProvider}
-                  cloudReasoningBaseUrl={cloudReasoningBaseUrl}
-                  setCloudReasoningBaseUrl={setCloudReasoningBaseUrl}
-                  openaiApiKey={openaiApiKey}
-                  setOpenaiApiKey={setOpenaiApiKey}
-                  anthropicApiKey={anthropicApiKey}
-                  setAnthropicApiKey={setAnthropicApiKey}
-                  geminiApiKey={geminiApiKey}
-                  setGeminiApiKey={setGeminiApiKey}
-                  groqApiKey={groqApiKey}
-                  setGroqApiKey={setGroqApiKey}
-                  customReasoningApiKey={customReasoningApiKey}
-                  setCustomReasoningApiKey={setCustomReasoningApiKey}
+                  reasoningModel={cleanupConfig.model}
+                  setReasoningModel={setCleanupModel}
+                  localReasoningProvider={cleanupConfig.provider}
+                  setLocalReasoningProvider={setCleanupProvider}
+                  cloudReasoningBaseUrl={cleanupConfig.cloudBaseUrl ?? ""}
+                  setCloudReasoningBaseUrl={setCleanupCloudBaseUrl}
+                  customReasoningApiKey={cleanupConfig.customApiKey ?? ""}
+                  setCustomReasoningApiKey={setCleanupCustomApiKey}
+                  setReasoningMode={setCleanupMode}
                 />
               </div>
             )}
+          </div>
+        )}
+
+        {/* System Audio Permission */}
+        {shouldShowSystemAudioPermission && (
+          <div
+            className={cn(
+              "rounded-lg border transition-colors duration-200",
+              systemAudioGranted
+                ? "border-success/20 bg-success/[0.03]"
+                : "border-foreground/8 dark:border-white/6 bg-surface-1/30 dark:bg-white/[0.02]"
+            )}
+          >
+            <div className="flex items-center justify-between w-full px-4 py-3">
+              <div className="flex items-center gap-2.5">
+                <Monitor
+                  size={13}
+                  className={cn(systemAudioGranted ? "text-success/60" : "text-foreground/30")}
+                />
+                <div>
+                  <span className="text-xs font-medium text-foreground/70">
+                    {t("notes.onboarding.systemAudio.title")}
+                  </span>
+                  <p className="text-xs text-foreground/30 leading-relaxed mt-0.5">
+                    {t("notes.onboarding.systemAudio.description")}
+                  </p>
+                </div>
+              </div>
+              {systemAudioGranted ? (
+                <span className="text-xs font-medium text-success/60 shrink-0">
+                  {t("notes.onboarding.systemAudio.enabled")}
+                </span>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleGrantSystemAudio}
+                  disabled={isRequestingSystemAudio}
+                  className="h-7 text-xs shrink-0"
+                >
+                  {isRequestingSystemAudio ? (
+                    <Loader2 size={12} className="animate-spin" />
+                  ) : (
+                    t("notes.onboarding.systemAudio.grant")
+                  )}
+                </Button>
+              )}
+            </div>
           </div>
         )}
 

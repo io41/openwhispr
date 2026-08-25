@@ -11,10 +11,11 @@ const {
   cleanupFiles,
 } = require("./lib/download-utils");
 
-const LLAMA_CPP_REPO = "ggerganov/llama.cpp";
+const LLAMA_CPP_REPO = "ggml-org/llama.cpp";
 
-// Version can be pinned via environment variable for reproducible builds
-const VERSION_OVERRIDE = process.env.LLAMA_CPP_VERSION || null;
+// Pinned to a tested build that loads current GGUF models. whisper-server is
+// statically linked, so bumping this can't affect local Whisper.
+const LLAMA_CPP_TAG = process.env.LLAMA_CPP_VERSION || "b9763";
 
 const BINARIES = {
   "darwin-arm64": {
@@ -53,12 +54,7 @@ let cachedRelease = null;
 
 async function getRelease() {
   if (cachedRelease) return cachedRelease;
-
-  if (VERSION_OVERRIDE) {
-    cachedRelease = await fetchLatestRelease(LLAMA_CPP_REPO, { tagPrefix: VERSION_OVERRIDE });
-  } else {
-    cachedRelease = await fetchLatestRelease(LLAMA_CPP_REPO);
-  }
+  cachedRelease = await fetchLatestRelease(LLAMA_CPP_REPO, { tag: LLAMA_CPP_TAG });
   return cachedRelease;
 }
 
@@ -170,11 +166,7 @@ function getEntriesForPlatformArch(platformArch) {
 }
 
 async function main() {
-  if (VERSION_OVERRIDE) {
-    console.log(`\n[llama-server] Using pinned version: ${VERSION_OVERRIDE}`);
-  } else {
-    console.log("\n[llama-server] Fetching latest release...");
-  }
+  console.log(`\n[llama-server] Using pinned version: ${LLAMA_CPP_TAG}`);
   const release = await getRelease();
 
   if (!release) {

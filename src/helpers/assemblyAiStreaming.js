@@ -9,6 +9,8 @@ const TOKEN_EXPIRY_MS = 300000;
 const REWARM_DELAY_MS = 2000;
 const MAX_REWARM_ATTEMPTS = 10;
 const KEEPALIVE_INTERVAL_MS = 15000;
+const MIN_FRAME_MS = 50;
+const MIN_FRAME_BYTES = (SAMPLE_RATE * 2 * MIN_FRAME_MS) / 1000;
 
 class AssemblyAiStreaming {
   constructor() {
@@ -19,6 +21,8 @@ class AssemblyAiStreaming {
     this.onFinalTranscript = null;
     this.onError = null;
     this.onSessionEnd = null;
+    this.onConnectionLost = null;
+    this.connectionLossNotified = false;
     this.pendingResolve = null;
     this.pendingReject = null;
     this.connectionTimeout = null;
@@ -36,6 +40,10 @@ class AssemblyAiStreaming {
     this.rewarmTimer = null;
     this.keepAliveInterval = null;
     this.isDisconnecting = false;
+    this.pendingAudio = [];
+    this.pendingAudioBytes = 0;
+    this.completedSegments = [];
+    this.speechStartedAt = null;
   }
 
   buildWebSocketUrl(options) {
@@ -46,8 +54,14 @@ class AssemblyAiStreaming {
       format_turns: "true",
       token: options.token,
     });
-    if (options.language && options.language !== "auto") {
-      params.set("speech_model", "universal-streaming-multilingual");
+    if (options.model) {
+      params.set("speech_model", options.model);
+    }
+    if (options.minTurnSilence != null) {
+      params.set("min_turn_silence", String(options.minTurnSilence));
+    }
+    if (options.maxTurnSilence != null) {
+      params.set("max_turn_silence", String(options.maxTurnSilence));
     }
     if (options.keyterms && options.keyterms.length > 0) {
       params.set("keyterms_prompt", JSON.stringify(options.keyterms.slice(0, 100)));
@@ -120,7 +134,10 @@ class AssemblyAiStreaming {
     debugLogger.debug("AssemblyAI warming up connection");
 
     return new Promise((resolve, reject) => {
+      let settled = false;
       const warmupTimeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
         this.cleanupWarmConnection();
         reject(new Error("AssemblyAI warmup connection timeout"));
       }, WEBSOCKET_TIMEOUT_MS);
@@ -134,7 +151,8 @@ class AssemblyAiStreaming {
       this.warmConnection.on("message", (data) => {
         try {
           const message = JSON.parse(data.toString());
-          if (message.type === "Begin") {
+          if (message.type === "Begin" && !settled) {
+            settled = true;
             clearTimeout(warmupTimeout);
             this.warmConnectionReady = true;
             this.warmSessionId = message.id || null;
@@ -151,7 +169,10 @@ class AssemblyAiStreaming {
         clearTimeout(warmupTimeout);
         debugLogger.error("AssemblyAI warmup connection error", { error: error.message });
         this.cleanupWarmConnection();
-        reject(error);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
       });
 
       this.warmConnection.on("close", (code, reason) => {
@@ -165,6 +186,11 @@ class AssemblyAiStreaming {
           reason: reason?.toString(),
         });
         this.cleanupWarmConnection();
+        if (!settled) {
+          settled = true;
+          reject(new Error(`AssemblyAI warmup connection closed before ready (code: ${code})`));
+          return;
+        }
         if (wasReady && savedOptions) {
           this.warmConnectionOptions = savedOptions;
           this.scheduleRewarm();
@@ -221,6 +247,7 @@ class AssemblyAiStreaming {
 
     this.ws = this.warmConnection;
     this.isConnected = true;
+    this.connectionLossNotified = false;
     this.sessionId = this.warmSessionId || null;
     this.warmConnection = null;
     this.warmConnectionReady = false;
@@ -233,9 +260,10 @@ class AssemblyAiStreaming {
 
     this.ws.removeAllListeners("error");
     this.ws.on("error", (error) => {
+      const wasActive = this.isConnected;
       debugLogger.error("AssemblyAI WebSocket error", { error: error.message });
       this.cleanup();
-      this.onError?.(error);
+      if (wasActive && !this.isDisconnecting) this.notifyConnectionLost(error);
     });
 
     this.ws.removeAllListeners("close");
@@ -248,7 +276,7 @@ class AssemblyAiStreaming {
       });
       this.cleanup();
       if (wasActive && !this.isDisconnecting) {
-        this.onError?.(new Error(`Connection lost (code: ${code})`));
+        this.notifyConnectionLost(new Error(`Connection lost (code: ${code})`));
       }
     });
 
@@ -294,6 +322,7 @@ class AssemblyAiStreaming {
     this.accumulatedText = "";
     this.lastTurnText = "";
     this.turns = [];
+    this.connectionLossNotified = false;
 
     // Try to use pre-warmed connection for instant start
     if (this.hasWarmConnection()) {
@@ -326,6 +355,7 @@ class AssemblyAiStreaming {
       });
 
       this.ws.on("error", (error) => {
+        const wasActive = this.isConnected;
         debugLogger.error("AssemblyAI WebSocket error", { error: error.message });
         this.cleanup();
         if (this.pendingReject) {
@@ -333,7 +363,11 @@ class AssemblyAiStreaming {
           this.pendingReject = null;
           this.pendingResolve = null;
         }
-        this.onError?.(error);
+        if (wasActive && !this.isDisconnecting) {
+          this.notifyConnectionLost(error);
+        } else if (!this.isDisconnecting) {
+          this.onError?.(error);
+        }
       });
 
       this.ws.on("close", (code, reason) => {
@@ -343,12 +377,27 @@ class AssemblyAiStreaming {
           reason: reason?.toString(),
           wasActive,
         });
+        if (this.pendingReject) {
+          this.pendingReject(new Error(`AssemblyAI WebSocket closed before ready (code: ${code})`));
+          this.pendingReject = null;
+          this.pendingResolve = null;
+        }
         this.cleanup();
         if (wasActive && !this.isDisconnecting) {
-          this.onError?.(new Error(`Connection lost (code: ${code})`));
+          this.notifyConnectionLost(new Error(`Connection lost (code: ${code})`));
         }
       });
     });
+  }
+
+  notifyConnectionLost(error) {
+    if (this.connectionLossNotified) return;
+    this.connectionLossNotified = true;
+    if (this.onConnectionLost) {
+      this.onConnectionLost(error);
+    } else {
+      this.onError?.(error);
+    }
   }
 
   handleMessage(data) {
@@ -385,9 +434,10 @@ class AssemblyAiStreaming {
                 // turn only when this variant is formatted, otherwise ignore duplicate.
                 if (message.turn_is_formatted && previousTurn.text !== trimmedTranscript) {
                   previousTurn.text = trimmedTranscript;
+                  this.completedSegments[this.completedSegments.length - 1] = trimmedTranscript;
                   this.lastTurnText = trimmedTranscript;
                   this.accumulatedText = this.turns.map((turn) => turn.text).join(" ");
-                  this.onFinalTranscript?.(this.accumulatedText);
+                  this.onFinalTranscript?.(this.accumulatedText, previousTurn.startedAt);
                   debugLogger.debug("AssemblyAI formatted turn update applied", {
                     text: trimmedTranscript.slice(0, 100),
                     totalAccumulated: this.accumulatedText.length,
@@ -400,13 +450,17 @@ class AssemblyAiStreaming {
                 break;
               }
 
+              const speechTimestamp = this.speechStartedAt || Date.now();
+              this.speechStartedAt = null;
               this.turns.push({
                 text: trimmedTranscript,
                 normalized: normalizedTranscript,
+                startedAt: speechTimestamp,
               });
+              this.completedSegments.push(trimmedTranscript);
               this.lastTurnText = trimmedTranscript;
               this.accumulatedText = this.turns.map((turn) => turn.text).join(" ");
-              this.onFinalTranscript?.(this.accumulatedText);
+              this.onFinalTranscript?.(this.accumulatedText, speechTimestamp);
               debugLogger.debug("AssemblyAI final transcript (end_of_turn)", {
                 text: message.transcript.slice(0, 100),
                 totalAccumulated: this.accumulatedText.length,
@@ -445,6 +499,10 @@ class AssemblyAiStreaming {
           this.onError?.(new Error(message.error));
           break;
 
+        case "SpeechStarted":
+          this.speechStartedAt = Date.now();
+          break;
+
         default:
           debugLogger.debug("AssemblyAI unknown message type", { type: message.type });
       }
@@ -466,7 +524,16 @@ class AssemblyAiStreaming {
       return false;
     }
 
-    this.ws.send(pcmBuffer);
+    this.pendingAudio.push(pcmBuffer);
+    this.pendingAudioBytes += pcmBuffer.length;
+    if (this.pendingAudioBytes < MIN_FRAME_BYTES) {
+      return true;
+    }
+
+    const frame = Buffer.concat(this.pendingAudio, this.pendingAudioBytes);
+    this.pendingAudio = [];
+    this.pendingAudioBytes = 0;
+    this.ws.send(frame);
     return true;
   }
 
@@ -521,6 +588,11 @@ class AssemblyAiStreaming {
   cleanup() {
     clearTimeout(this.connectionTimeout);
     this.connectionTimeout = null;
+
+    this.pendingAudio = [];
+    this.pendingAudioBytes = 0;
+    this.completedSegments = [];
+    this.speechStartedAt = null;
 
     if (this.ws) {
       try {

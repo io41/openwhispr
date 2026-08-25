@@ -1,32 +1,32 @@
 const { autoUpdater } = require("electron-updater");
+const { appUpdatesEnabled } = require("./helpers/updateCheckPolicy");
 
 class UpdateManager {
   constructor() {
-    this.mainWindow = null;
-    this.controlPanelWindow = null;
     this.updateAvailable = false;
     this.updateDownloaded = false;
     this.lastUpdateInfo = null;
     this.isInstalling = false;
     this.isDownloading = false;
+    this.isQuittingForUpdate = false;
+    this.handleBeforeQuitForUpdate = null;
     this.eventListeners = [];
+    this.updateCheckInterval = null;
+    this.windowManager = null;
+    this._suppressNotification = false;
 
     this.setupAutoUpdater();
   }
 
-  setWindows(mainWindow, controlPanelWindow) {
-    this.mainWindow = mainWindow;
-    this.controlPanelWindow = controlPanelWindow;
+  setWindowManager(windowManager) {
+    this.windowManager = windowManager;
   }
 
   setupAutoUpdater() {
-    // Only configure auto-updater in production
     if (process.env.NODE_ENV === "development") {
-      // Auto-updater disabled in development mode
       return;
     }
 
-    // Configure auto-updater for GitHub releases
     autoUpdater.setFeedURL({
       provider: "github",
       owner: "OpenWhispr",
@@ -64,18 +64,10 @@ class UpdateManager {
       autoUpdater.channel = nativeArch === "arm64" ? "latest-arm64" : "latest-x64";
     }
 
-    // Disable auto-download - let user control when to download
     autoUpdater.autoDownload = false;
-
-    // Enable auto-install on quit - if user ignores update and quits normally,
-    // the update will install automatically (best UX)
-    // User can also manually trigger install with "Install & Restart" button
     autoUpdater.autoInstallOnAppQuit = true;
-
-    // Enable logging in production for debugging (logs are user-accessible)
     autoUpdater.logger = console;
 
-    // Set up event handlers
     this.setupEventHandlers();
   }
 
@@ -95,16 +87,26 @@ class UpdateManager {
           };
         }
         this.notifyRenderers("update-available", info);
+        const notifAllowed = appUpdatesEnabled(this.windowManager?.notificationPrefs);
+        if (this.windowManager && info && !this._suppressNotification && notifAllowed) {
+          this.windowManager.showUpdateNotification(info).catch((err) => {
+            console.error("Failed to show update notification:", err);
+          });
+        }
+        this._suppressNotification = false;
       },
       "update-not-available": (info) => {
         this.updateAvailable = false;
-        this.updateDownloaded = false;
-        this.isDownloading = false;
-        this.lastUpdateInfo = null;
+        this._suppressNotification = false;
+        if (!this.updateDownloaded) {
+          this.isDownloading = false;
+          this.lastUpdateInfo = null;
+        }
         this.notifyRenderers("update-not-available", info);
       },
       error: (err) => {
         console.error("❌ Auto-updater error:", err);
+        this._suppressNotification = false;
         this.isDownloading = false;
         this.notifyRenderers("update-error", err);
       },
@@ -130,23 +132,31 @@ class UpdateManager {
       },
     };
 
-    // Register and track event listeners for cleanup
     Object.entries(handlers).forEach(([event, handler]) => {
       autoUpdater.on(event, handler);
       this.eventListeners.push({ event, handler });
     });
+
+    // electron-updater and Squirrel.Mac emit this on Electron's native
+    // autoUpdater (before any windows close), not on the electron-updater instance.
+    this.handleBeforeQuitForUpdate = () => {
+      this.isQuittingForUpdate = true;
+      if (this.windowManager) {
+        this.windowManager.isQuitting = true;
+        this.windowManager.hotkeyManager.unregisterAll();
+      }
+    };
+    require("electron").autoUpdater.on("before-quit-for-update", this.handleBeforeQuitForUpdate);
   }
 
   notifyRenderers(channel, data) {
-    if (this.mainWindow && !this.mainWindow.isDestroyed() && this.mainWindow.webContents) {
-      this.mainWindow.webContents.send(channel, data);
-    }
-    if (
-      this.controlPanelWindow &&
-      !this.controlPanelWindow.isDestroyed() &&
-      this.controlPanelWindow.webContents
-    ) {
-      this.controlPanelWindow.webContents.send(channel, data);
+    // Read window refs live from windowManager: cached refs go stale when the
+    // control panel is created after boot (start minimized) or recreated.
+    const { mainWindow, controlPanelWindow } = this.windowManager ?? {};
+    for (const win of [mainWindow, controlPanelWindow]) {
+      if (win && !win.isDestroyed() && win.webContents) {
+        win.webContents.send(channel, data);
+      }
     }
   }
 
@@ -160,14 +170,11 @@ class UpdateManager {
       }
 
       console.log("🔍 Checking for updates...");
+      this._suppressNotification = true;
       const result = await autoUpdater.checkForUpdates();
 
       if (result?.isUpdateAvailable && result?.updateInfo) {
         console.log("📋 Update available:", result.updateInfo.version);
-        console.log(
-          "📦 Download size:",
-          result.updateInfo.files?.map((f) => `${(f.size / 1024 / 1024).toFixed(2)}MB`).join(", ")
-        );
         return {
           updateAvailable: true,
           version: result.updateInfo.version,
@@ -250,15 +257,6 @@ class UpdateManager {
       this.isInstalling = true;
       console.log("🔄 Installing update and restarting...");
 
-      const { app, BrowserWindow } = require("electron");
-
-      // Remove listeners that prevent windows from closing
-      // so quitAndInstall can shut down cleanly
-      app.removeAllListeners("window-all-closed");
-      BrowserWindow.getAllWindows().forEach((win) => {
-        win.removeAllListeners("close");
-      });
-
       const isSilent = process.platform === "win32";
       autoUpdater.quitAndInstall(isSilent, true);
 
@@ -302,22 +300,48 @@ class UpdateManager {
     }
   }
 
+  // Prefs are read at fire time, not scheduling time, so flipping the
+  // "App updates" toggle takes effect without a restart (#1605).
+  _autoCheckForUpdates(label) {
+    if (!appUpdatesEnabled(this.windowManager?.notificationPrefs)) {
+      console.log(`⏭️ ${label} update check skipped (app updates disabled)`);
+      return;
+    }
+    console.log(`🔄 ${label} update check...`);
+    autoUpdater.checkForUpdates().catch((err) => {
+      console.error(`${label} update check failed:`, err);
+    });
+  }
+
   checkForUpdatesOnStartup() {
     if (process.env.NODE_ENV !== "development") {
       setTimeout(() => {
-        console.log("🔄 Checking for updates on startup...");
-        autoUpdater.checkForUpdates().catch((err) => {
-          console.error("Startup update check failed:", err);
-        });
+        this._autoCheckForUpdates("Startup");
       }, 3000);
+
+      const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+      this.updateCheckInterval = setInterval(() => {
+        this._autoCheckForUpdates("Periodic");
+      }, FOUR_HOURS_MS);
     }
   }
 
   cleanup() {
+    if (this.updateCheckInterval) {
+      clearInterval(this.updateCheckInterval);
+      this.updateCheckInterval = null;
+    }
     this.eventListeners.forEach(({ event, handler }) => {
       autoUpdater.removeListener(event, handler);
     });
     this.eventListeners = [];
+    if (this.handleBeforeQuitForUpdate) {
+      require("electron").autoUpdater.removeListener(
+        "before-quit-for-update",
+        this.handleBeforeQuitForUpdate
+      );
+      this.handleBeforeQuitForUpdate = null;
+    }
   }
 }
 

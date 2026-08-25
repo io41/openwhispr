@@ -3,10 +3,12 @@ import type { TranscriptionItem } from "../types/electron";
 
 interface TranscriptionState {
   transcriptions: TranscriptionItem[];
+  includeDiscarded: boolean;
 }
 
 const useTranscriptionStore = create<TranscriptionState>()(() => ({
   transcriptions: [],
+  includeDiscarded: false,
 }));
 
 let hasBoundIpcListeners = false;
@@ -40,6 +42,17 @@ function ensureIpcListeners() {
     }
   }
 
+  if (window.electronAPI?.onTranscriptionUpdated) {
+    const dispose = window.electronAPI.onTranscriptionUpdated((item) => {
+      if (item) {
+        updateTranscription(item);
+      }
+    });
+    if (typeof dispose === "function") {
+      disposers.push(dispose);
+    }
+  }
+
   if (window.electronAPI?.onTranscriptionsCleared) {
     const dispose = window.electronAPI.onTranscriptionsCleared(() => {
       clearTranscriptions();
@@ -56,16 +69,20 @@ function ensureIpcListeners() {
   });
 }
 
-export async function initializeTranscriptions(limit = DEFAULT_LIMIT) {
+export async function initializeTranscriptions(
+  limit = currentLimit,
+  includeDiscarded = useTranscriptionStore.getState().includeDiscarded
+) {
   currentLimit = limit;
   ensureIpcListeners();
-  const items = await window.electronAPI.getTranscriptions(limit);
-  useTranscriptionStore.setState({ transcriptions: items });
+  const items = await window.electronAPI.getTranscriptions(limit, { includeDiscarded });
+  useTranscriptionStore.setState({ transcriptions: items, includeDiscarded });
   return items;
 }
 
 export function addTranscription(item: TranscriptionItem) {
   if (!item) return;
+  if (item.status === "discarded" && !useTranscriptionStore.getState().includeDiscarded) return;
   const { transcriptions } = useTranscriptionStore.getState();
   const withoutDuplicate = transcriptions.filter((existing) => existing.id !== item.id);
   useTranscriptionStore.setState({
@@ -81,6 +98,13 @@ export function removeTranscription(id: number) {
   useTranscriptionStore.setState({ transcriptions: next });
 }
 
+export function updateTranscription(item: TranscriptionItem) {
+  if (!item) return;
+  const { transcriptions } = useTranscriptionStore.getState();
+  const next = transcriptions.map((existing) => (existing.id === item.id ? item : existing));
+  useTranscriptionStore.setState({ transcriptions: next });
+}
+
 export function clearTranscriptions() {
   if (useTranscriptionStore.getState().transcriptions.length === 0) return;
   useTranscriptionStore.setState({ transcriptions: [] });
@@ -88,4 +112,8 @@ export function clearTranscriptions() {
 
 export function useTranscriptions() {
   return useTranscriptionStore((state) => state.transcriptions);
+}
+
+export function useShowDiscarded() {
+  return useTranscriptionStore((state) => state.includeDiscarded);
 }
